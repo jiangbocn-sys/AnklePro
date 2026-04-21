@@ -24,7 +24,7 @@ jobs:
         with:
           python-version: '3.12'
           cache: 'pip'
-
+          
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -33,7 +33,7 @@ jobs:
 
       - name: Build with PyInstaller
         run: |
-          pyinstaller --clean --additional-hooks-dir=hooks anklepro.spec
+          pyinstaller --clean anklepro.spec
 
       - name: Verify build output
         run: |
