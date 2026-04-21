@@ -81,4 +81,4 @@ hiddenimports += [
 # 收集 PyQt5 相关
 hiddenimports += collect_submodules('PyQt5')
 
-print(f"VTK hook: 收集了 {len(hiddenimports)} 个隐藏导入")
+print(f"VTK hook: collected  {len(hiddenimports)} hidden imports")
