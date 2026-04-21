@@ -5,6 +5,10 @@ PyInstaller hook for VTK
 
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files, get_module_file_attribute
 
+import sys
+import io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
 # 收集 vtk 的所有子模块
 hiddenimports = collect_submodules('vtk')
 
