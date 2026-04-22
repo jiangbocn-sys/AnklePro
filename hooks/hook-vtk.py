@@ -2,31 +2,34 @@
 PyInstaller hook for VTK
 确保 VTK 模块被正确打包
 """
-from PyInstaller.utils.hooks import collect_submodules, collect_dynamic_libs, collect_data_files, get_module_file_attribute
+from PyInstaller.utils.hooks import (
+    collect_submodules,
+    collect_dynamic_libs,
+    collect_data_files,
+    get_module_file_attribute
+)
 
 import sys
 import io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
-# 收集 vtk 的所有子模块
+# ---------- 初始化 PyInstaller 要求的全局变量 ----------
+binaries = []   # 必须初始化，否则后面 .extend 会报 NameError
+datas = []      # 也统一初始化
+
+# ---------- 收集 vtk 的所有子模块 ----------
 hiddenimports = collect_submodules('vtk')
 
-# 收集 vtk 的数据文件
-datas = []
-
+# ---------- 收集数据文件 ----------
 try:
-    datas = collect_data_files('vtk')
+    datas.extend(collect_data_files('vtk'))
 except Exception:
     pass
 
-# 确保包含 vtk.qt 模块
+# ---------- 手动添加特定隐藏导入 ----------
 hiddenimports += [
     'vtk.qt',
     'vtk.qt.QVTKRenderWindowInteractor',
-]
-
-# VTK 渲染模块
-hiddenimports += [
     'vtkRenderingCore',
     'vtkRenderingCore_python',
     'vtkInteractionStyle',
@@ -77,16 +80,30 @@ hiddenimports += [
     'vtkWrappingPythonCore',
 ]
 
-# 收集 PyQt5 相关
+# ---------- PyQt5 子模块 ----------
 hiddenimports += collect_submodules('PyQt5')
 
-print(f"VTK hook: collected  {len(hiddenimports)} hidden imports")
-
-# 收集 vtkmodules.qt 子模块（新版 VTK 中 vtk.qt 实际指向这里）
+# ---------- vtkmodules.qt 子模块（新版 VTK） ----------
 hiddenimports += collect_submodules('vtkmodules.qt')
 
-# 强制收集 vtkmodules.qt 目录下的所有 .pyd 和 .dll 文件
-binaries.extend(collect_dynamic_libs('vtkmodules.qt'))
+# ---------- 收集动态库（DLL/.pyd） ----------
+try:
+    binaries.extend(collect_dynamic_libs('vtk'))
+except Exception:
+    pass
+try:
+    binaries.extend(collect_dynamic_libs('vtkmodules'))
+except Exception:
+    pass
+try:
+    binaries.extend(collect_dynamic_libs('vtkmodules.qt'))
+except Exception:
+    pass
 
-# 收集可能的数据文件
-datas += collect_data_files('vtkmodules.qt')
+# ---------- 额外数据文件 ----------
+try:
+    datas.extend(collect_data_files('vtkmodules.qt'))
+except Exception:
+    pass
+
+print(f"VTK hook: collected {len(hiddenimports)} hidden imports, {len(binaries)} binaries, {len(datas)} datas")
