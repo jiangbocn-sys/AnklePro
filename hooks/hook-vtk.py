@@ -86,7 +86,7 @@ print(f"VTK hook: collected  {len(hiddenimports)} hidden imports")
 hiddenimports += collect_submodules('vtkmodules.qt')
 
 # 强制收集 vtkmodules.qt 目录下的所有 .pyd 和 .dll 文件
-binaries += collect_dynamic_libs('vtkmodules.qt')
+binaries.extend(collect_dynamic_libs('vtkmodules.qt'))
 
 # 收集可能的数据文件
 datas += collect_data_files('vtkmodules.qt')
