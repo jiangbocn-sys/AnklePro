@@ -33,7 +33,7 @@ jobs:
 
       - name: Build with PyInstaller
         run: |
-          pyinstaller --clean anklepro.spec --collect-all vtkmodules --collect-all PyQt5
+          pyinstaller --clean anklepro.spec
 
       - name: Verify build output
         run: |
