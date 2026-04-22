@@ -2,8 +2,7 @@
 PyInstaller hook for VTK
 确保 VTK 模块被正确打包
 """
-
-from PyInstaller.utils.hooks import collect_submodules, collect_data_files, get_module_file_attribute
+from PyInstaller.utils.hooks import collect_submodules, collect_dynamic_libs, collect_data_files, get_module_file_attribute
 
 import sys
 import io
@@ -82,8 +81,6 @@ hiddenimports += [
 hiddenimports += collect_submodules('PyQt5')
 
 print(f"VTK hook: collected  {len(hiddenimports)} hidden imports")
-
-from PyInstaller.utils.hooks import collect_submodules, collect_dynamic_libs, collect_data_files
 
 # 收集 vtkmodules.qt 子模块（新版 VTK 中 vtk.qt 实际指向这里）
 hiddenimports += collect_submodules('vtkmodules.qt')
