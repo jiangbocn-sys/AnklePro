@@ -82,3 +82,14 @@ hiddenimports += [
 hiddenimports += collect_submodules('PyQt5')
 
 print(f"VTK hook: collected  {len(hiddenimports)} hidden imports")
+
+from PyInstaller.utils.hooks import collect_submodules, collect_dynamic_libs, collect_data_files
+
+# 收集 vtkmodules.qt 子模块（新版 VTK 中 vtk.qt 实际指向这里）
+hiddenimports += collect_submodules('vtkmodules.qt')
+
+# 强制收集 vtkmodules.qt 目录下的所有 .pyd 和 .dll 文件
+binaries += collect_dynamic_libs('vtkmodules.qt')
+
+# 收集可能的数据文件
+datas += collect_data_files('vtkmodules.qt')
