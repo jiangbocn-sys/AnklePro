@@ -8,7 +8,13 @@ PyInstaller 打包配置
     dist/AnklePro.exe - Windows 可执行文件
 """
 
+from PyInstaller.utils.hooks import collect_all
+
 block_cipher = None
+
+# 强制收集 vtkmodules 和 PyQt5 的全部依赖
+vtk_binaries, vtk_datas, vtk_hiddenimports = collect_all('vtkmodules')
+pyqt_binaries, pyqt_datas, pyqt_hiddenimports = collect_all('PyQt5')
 
 a = Analysis(
     ['src/main.py'],
@@ -45,6 +51,11 @@ a = Analysis(
         'scipy._lib.messagestream',
         'scipy._lib',
     ],
+
+    binaries=binaries + vtk_binaries + pyqt_binaries,
+    datas=datas + vtk_datas + pyqt_datas,
+    hiddenimports=hiddenimports + vtk_hiddenimports + pyqt_hiddenimports,
+
     hookspath=['hooks'],
     hooksconfig={},
     runtime_hooks=[],
