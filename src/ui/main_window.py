@@ -309,9 +309,12 @@ class MainWindow(QMainWindow):
         self.btn_measure.clicked.connect(self._toggle_measurement)
         control_layout.addWidget(self.btn_measure)
 
-        # ---- 护具尺寸修改 ----
-        deform_group = QGroupBox("护具尺寸修改")
-        deform_layout = QVBoxLayout()
+        control_layout.addStretch()
+        tab_widget.addTab(control_tab, "设置")
+
+        # Tab 5: 护具尺寸修改
+        deform_tab = QWidget()
+        deform_layout = QVBoxLayout(deform_tab)
 
         btn_load_step = QPushButton("加载护具 STEP")
         btn_load_step.clicked.connect(self._load_brace_step)
@@ -361,11 +364,8 @@ class MainWindow(QMainWindow):
         export_btn_row.addWidget(self.btn_export_step)
         deform_layout.addLayout(export_btn_row)
 
-        deform_group.setLayout(deform_layout)
-        control_layout.addWidget(deform_group)
-
-        control_layout.addStretch()
-        tab_widget.addTab(control_tab, "设置")
+        deform_layout.addStretch()
+        tab_widget.addTab(deform_tab, "尺寸修改")
 
         panel_layout.addWidget(tab_widget)
 
@@ -658,6 +658,55 @@ class MainWindow(QMainWindow):
         )
         if not filepath:
             return
+
+        # 询问是否转换为 STEP 进行处理
+        reply = QMessageBox.question(
+            self,
+            "转换为 STEP",
+            "是否将此 STL 文件转换为 STEP 进行高精度处理？\n\n"
+            "选择「是」：转换为 STEP 后加载（支持精确尺寸修改）\n"
+            "选择「否」：直接加载原始 STL 文件",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+
+        if reply == QMessageBox.Yes:
+            # STL → STEP → 高精度 STL
+            try:
+                self.status_bar.showMessage("正在将 STL 转换为 STEP...")
+                self._render()
+
+                step_path = stl_to_step(filepath, tolerance=0.1)
+                self.status_bar.showMessage(
+                    f"STEP 已生成: {Path(step_path).name}"
+                )
+
+                # 从 STEP 高精度网格化加载
+                stl_path = step_path.replace(".step", "_mesh.stl").replace(".stp", "_mesh.stl")
+                if stl_path == step_path:
+                    stl_path = step_path + "_mesh.stl"
+                step_to_stl(step_path, stl_path, linear_deflection=0.05)
+
+                self._brace_step_filepath = step_path
+                self._prepare_and_load(stl_path)
+
+                self.status_bar.showMessage(
+                    f"已加载护具 (STL→STEP→STL): "
+                    f"{Path(filepath).name} → {Path(stl_path).name}"
+                )
+            except Exception as e:
+                QMessageBox.critical(
+                    self, "转换失败",
+                    f"STEP 转换失败，将加载原始 STL 文件:\n{e}"
+                )
+                self._brace_step_filepath = None
+                self._prepare_and_load(filepath)
+        else:
+            self._brace_step_filepath = None
+            self._prepare_and_load(filepath)
+
+    def _prepare_and_load(self, stl_path: str):
+        """清除旧状态并加载护具 STL（通用流程）"""
         try:
             # 清除旧的内侧面
             self._refresh_inner_highlight()
@@ -667,17 +716,14 @@ class MainWindow(QMainWindow):
             self._region_actor_map.clear()
             self.region_list.clear()
 
-            # 清除旧的距离标示
+            # 清除旧的距离标示和变形状态
             self.scene.clear_min_max_indicators()
-
-            # 清除变形状态
             self.deformation_state.clear()
             self.deformation_engine = None
             self._deformed_inner_vertices = None
             self._original_inner_vertices = None
-            self._brace_step_filepath = None
 
-            self.brace_model = load_stl(filepath)
+            self.brace_model = load_stl(stl_path)
             self.lbl_brace.setText(f"护具模型: {self.brace_model.name}")
             self.brace_transform = TransformManager(
                 center=self.brace_model.centroid
@@ -701,10 +747,10 @@ class MainWindow(QMainWindow):
             self._render()
 
             # 保存当前护具文件路径用于位置文件管理
-            self._current_brace_filepath = filepath
+            self._current_brace_filepath = stl_path
 
             # 自动加载保存的位置
-            self._auto_load_brace_positions(filepath)
+            self._auto_load_brace_positions(stl_path)
         except Exception as e:
             QMessageBox.critical(self, "加载失败", f"无法加载护具模型:\n{e}")
 
@@ -988,7 +1034,7 @@ class MainWindow(QMainWindow):
 
             # 用标准流程加载 STL
             self._brace_step_filepath = filepath
-            self._load_brace_from_stl(stl_path)
+            self._prepare_and_load(stl_path)
 
             self.status_bar.showMessage(
                 f"已加载护具 STEP: {Path(filepath).name} "
@@ -997,28 +1043,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "加载失败", f"无法加载 STEP 文件:\n{e}")
             self.status_bar.showMessage("STEP 加载失败")
-
-    def _load_brace_from_stl(self, stl_path: str):
-        """从 STL 文件加载护具（内部方法，供 STEP 转换后调用）"""
-        try:
-            self.brace_model = load_stl(stl_path)
-            self.lbl_brace.setText(f"护具模型: {self.brace_model.name}")
-            self.brace_transform = TransformManager(
-                center=self.brace_model.centroid
-            )
-
-            if self.scene._brace_actor:
-                self.scene.renderer.RemoveActor(self.scene._brace_actor)
-            self.scene.add_brace_model(self.brace_model.polydata)
-
-            if self.foot_model and self.brace_model:
-                self._update_axes()
-            else:
-                self.scene.fit_camera_to_models()
-
-            self._render()
-        except Exception as e:
-            QMessageBox.critical(self, "加载失败", f"无法加载 STL:\n{e}")
 
     def _ensure_deformation_engine(self):
         """确保变形引擎已初始化"""
