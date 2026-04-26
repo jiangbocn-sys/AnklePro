@@ -148,6 +148,46 @@ finally:
         os.unlink(script_path)
 
 
+class _BraceToStepWorker(QThread):
+    """后台线程：将当前 VTK 护具 polydata 转换为 STEP 再网格化"""
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(str)  # 输出 STL 路径
+    error = pyqtSignal(str)
+
+    def __init__(self, polydata: vtk.vtkPolyData, stl_path: str):
+        super().__init__()
+        self.polydata = polydata
+        self.stl_path = stl_path
+
+    def run(self):
+        try:
+            import tempfile
+
+            # 1. 导出临时 STL
+            temp_stl = self.stl_path + ".orig.stl"
+            writer = vtk.vtkSTLWriter()
+            writer.SetFileName(temp_stl)
+            writer.SetInputData(self.polydata)
+            writer.Write()
+
+            self.progress.emit("正在转换为 STEP...")
+            # 2. STL → STEP
+            step_path = stl_to_step(temp_stl, tolerance=0.1)
+
+            self.progress.emit("正在高精度网格化...")
+            # 3. STEP → 高精度 STL
+            step_to_stl(step_path, self.stl_path, linear_deflection=0.05)
+
+            # 清理临时文件
+            for f in [temp_stl, step_path]:
+                if os.path.exists(f):
+                    os.unlink(f)
+
+            self.finished.emit(self.stl_path)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 class MainWindow(QMainWindow):
     """AnklePro 主窗口"""
 
@@ -405,9 +445,20 @@ class MainWindow(QMainWindow):
         deform_tab = QWidget()
         deform_layout = QVBoxLayout(deform_tab)
 
-        btn_load_step = QPushButton("加载护具 STEP")
+        # STEP 加载/转换区域
+        step_load_group = QGroupBox("STEP 加载")
+        step_load_layout = QVBoxLayout()
+
+        btn_load_step = QPushButton("加载护具 STEP 文件")
         btn_load_step.clicked.connect(self._load_brace_step)
-        deform_layout.addWidget(btn_load_step)
+        step_load_layout.addWidget(btn_load_step)
+
+        btn_convert_brace = QPushButton("将已加载护具转换为 STEP")
+        btn_convert_brace.clicked.connect(self._convert_brace_to_step)
+        step_load_layout.addWidget(btn_convert_brace)
+
+        step_load_group.setLayout(step_load_layout)
+        deform_layout.addWidget(step_load_group)
 
         # 变形模式选择
         deform_layout.addWidget(QLabel("变形模式:"))
@@ -741,58 +792,15 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "加载失败", f"无法加载足部模型:\n{e}")
 
     def _load_brace(self):
-        """加载护具 STL 文件"""
+        """加载护具 STL 文件（直接加载，不转换 STEP）"""
         filepath, _ = QFileDialog.getOpenFileName(
             self, "选择护具 STL 文件", "", "STL Files (*.stl)"
         )
         if not filepath:
             return
 
-        # 询问是否转换为 STEP 进行处理
-        reply = QMessageBox.question(
-            self,
-            "转换为 STEP",
-            "是否将此 STL 文件转换为 STEP 进行高精度处理？\n\n"
-            "选择「是」：转换为 STEP 后加载（支持精确尺寸修改）\n"
-            "选择「否」：直接加载原始 STL 文件",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-
-        if reply == QMessageBox.Yes:
-            # STL → STEP → 高精度 STL
-            try:
-                self.status_bar.showMessage("正在将 STL 转换为 STEP...")
-                self._render()
-
-                step_path = stl_to_step(filepath, tolerance=0.1)
-                self.status_bar.showMessage(
-                    f"STEP 已生成: {Path(step_path).name}"
-                )
-
-                # 从 STEP 高精度网格化加载
-                stl_path = step_path.replace(".step", "_mesh.stl").replace(".stp", "_mesh.stl")
-                if stl_path == step_path:
-                    stl_path = step_path + "_mesh.stl"
-                step_to_stl(step_path, stl_path, linear_deflection=0.05)
-
-                self._brace_step_filepath = step_path
-                self._prepare_and_load(stl_path)
-
-                self.status_bar.showMessage(
-                    f"已加载护具 (STL→STEP→STL): "
-                    f"{Path(filepath).name} → {Path(stl_path).name}"
-                )
-            except Exception as e:
-                QMessageBox.critical(
-                    self, "转换失败",
-                    f"STEP 转换失败，将加载原始 STL 文件:\n{e}"
-                )
-                self._brace_step_filepath = None
-                self._prepare_and_load(filepath)
-        else:
-            self._brace_step_filepath = None
-            self._prepare_and_load(filepath)
+        self._brace_step_filepath = None
+        self._prepare_and_load(filepath)
 
     def _prepare_and_load(self, stl_path: str):
         """清除旧状态并加载护具 STL（通用流程）"""
@@ -842,6 +850,99 @@ class MainWindow(QMainWindow):
             self._auto_load_brace_positions(stl_path)
         except Exception as e:
             QMessageBox.critical(self, "加载失败", f"无法加载护具模型:\n{e}")
+
+    def _convert_brace_to_step(self):
+        """将当前已加载的护具 STL 转换为 STEP 进行高精度处理"""
+        if self.brace_model is None:
+            QMessageBox.warning(self, "警告", "请先在「模型」标签页加载护具 STL")
+            return
+
+        # 检查是否已有对应的 STEP 文件
+        brace_path = self._current_brace_filepath
+        if brace_path and os.path.exists(brace_path):
+            # 尝试同目录下同名的 STEP 文件
+            base = os.path.splitext(brace_path)[0]
+            candidates = [base + ".step", base + ".stp"]
+            existing_step = None
+            for c in candidates:
+                if os.path.exists(c):
+                    existing_step = c
+                    break
+
+            if existing_step:
+                reply = QMessageBox.question(
+                    self, "STEP 文件已存在",
+                    f"已找到对应的 STEP 文件：\n{Path(existing_step).name}\n\n"
+                    f"是否直接加载 STEP 而非重新转换？",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes,
+                )
+                if reply == QMessageBox.Yes:
+                    self._load_brace_step_from_file(existing_step)
+                    return
+
+        # 执行转换：当前护具 STL → STEP → 高精度 STL
+        try:
+            self._step_progress = QProgressDialog(
+                "正在转换为 STEP 并网格化...",
+                "取消", 0, 0, self
+            )
+            self._step_progress.setWindowTitle("STEP 转换")
+            self._step_progress.setWindowModality(Qt.WindowModal)
+            self._step_progress.setMinimumDuration(0)
+            self._step_progress.show()
+
+            # 临时 STL 文件
+            stl_temp = "/tmp/anklepro_brace_converted.stl"
+
+            self._step_worker = _BraceToStepWorker(
+                self.brace_model.polydata, stl_temp
+            )
+            self._step_worker.progress.connect(
+                self._step_progress.setLabelText
+            )
+            self._step_worker.finished.connect(
+                self._on_convert_brace_to_step_done
+            )
+            self._step_worker.error.connect(self._on_step_conversion_error)
+            self._step_worker.start()
+        except Exception as e:
+            QMessageBox.critical(self, "转换失败", f"无法转换为 STEP:\n{e}")
+
+    def _on_convert_brace_to_step_done(self, stl_path: str):
+        """当前护具转换为 STEP 完成回调"""
+        self._step_progress.close()
+        self._brace_step_filepath = stl_path
+        self._prepare_and_load(stl_path)
+        self.status_bar.showMessage(
+            f"已加载护具 (STEP 高精度): {Path(stl_path).name}"
+        )
+
+    def _load_brace_step_from_file(self, step_path: str):
+        """从指定 STEP 文件加载护具"""
+        self._brace_step_filepath = step_path
+        stl_path = step_path.replace(".step", "_mesh.stl").replace(
+            ".stp", "_mesh.stl"
+        )
+        if stl_path == step_path:
+            stl_path = step_path + "_mesh.stl"
+
+        self._step_progress = QProgressDialog(
+            "正在从 STEP 加载护具...",
+            "取消", 0, 0, self
+        )
+        self._step_progress.setWindowTitle("STEP 转换")
+        self._step_progress.setWindowModality(Qt.WindowModal)
+        self._step_progress.setMinimumDuration(0)
+        self._step_progress.show()
+
+        self._step_worker = FreeCADWorker(step_path, stl_path)
+        self._step_worker.progress.connect(
+            self._step_progress.setLabelText
+        )
+        self._step_worker.finished.connect(self._on_step_conversion_done)
+        self._step_worker.error.connect(self._on_step_conversion_error)
+        self._step_worker.start()
 
     def _pick_inner_surface(self):
         """自动识别护具内侧面，拆分为连通区域"""
@@ -1103,31 +1204,7 @@ class MainWindow(QMainWindow):
         )
         if not filepath:
             return
-
-        stl_path = filepath.replace(".step", "_mesh.stl").replace(".stp", "_mesh.stl")
-        if stl_path == filepath:
-            stl_path = filepath + "_mesh.stl"
-
-        self._brace_step_filepath = filepath
-        self._step_stl_path = stl_path
-
-        # 进度对话框
-        self._step_progress = QProgressDialog(
-            "正在从 STEP 加载护具...",
-            "取消", 0, 0, self
-        )
-        self._step_progress.setWindowTitle("STEP 转换")
-        self._step_progress.setWindowModality(Qt.WindowModal)
-        self._step_progress.setMinimumDuration(0)
-        self._step_progress.setValue(0)
-        self._step_progress.show()
-
-        # 启动后台线程
-        self._step_worker = FreeCADWorker(filepath, stl_path)
-        self._step_worker.progress.connect(self._step_progress.setLabelText)
-        self._step_worker.finished.connect(self._on_step_conversion_done)
-        self._step_worker.error.connect(self._on_step_conversion_error)
-        self._step_worker.start()
+        self._load_brace_step_from_file(filepath)
 
     def _on_step_conversion_done(self, stl_path: str):
         """STEP 转换完成回调"""
