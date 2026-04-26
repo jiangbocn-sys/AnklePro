@@ -6,7 +6,7 @@ from typing import Optional
 
 import numpy as np
 import vtk
-from PyQt5.QtCore import Qt, QTimer, QEvent
+from PyQt5.QtCore import Qt, QTimer, QEvent, QThread, pyqtSignal
 from PyQt5.QtGui import QColor, QFont
 from PyQt5.QtWidgets import (
     QAction,
@@ -20,6 +20,7 @@ from PyQt5.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QStatusBar,
     QTableWidget,
@@ -57,6 +58,28 @@ from src.core.deformation_state import DeformationState, DeformationStep
 from src.core.step_converter import step_to_stl, stl_to_step, get_step_info
 from src.render.scene_manager import SceneManager
 from src.render.interactor_style import BraceCameraInteractorStyle
+
+
+class FreeCADWorker(QThread):
+    """后台线程：执行 FreeCAD STEP→STL 转换"""
+    progress = pyqtSignal(str)  # 进度消息
+    finished = pyqtSignal(str)  # 输出 STL 路径
+    error = pyqtSignal(str)     # 错误信息
+
+    def __init__(self, step_path: str, stl_path: str):
+        super().__init__()
+        self.step_path = step_path
+        self.stl_path = stl_path
+
+    def run(self):
+        try:
+            self.progress.emit("正在解析 STEP 几何...")
+            get_step_info(self.step_path)
+            self.progress.emit("正在进行网格化转换 (可能需要几分钟)...")
+            step_to_stl(self.step_path, self.stl_path, linear_deflection=0.05)
+            self.finished.emit(self.stl_path)
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 class MainWindow(QMainWindow):
@@ -1015,34 +1038,60 @@ class MainWindow(QMainWindow):
         if not filepath:
             return
 
-        try:
-            self.status_bar.showMessage("正在从 STEP 加载护具...")
-            self._render()
+        stl_path = filepath.replace(".step", "_mesh.stl").replace(".stp", "_mesh.stl")
+        if stl_path == filepath:
+            stl_path = filepath + "_mesh.stl"
 
-            # 获取 STEP 几何信息
-            info = get_step_info(filepath)
-            self.status_bar.showMessage(
-                f"STEP 文件: {info.get('faces', '?')} faces, "
-                f"{info.get('solids', '?')} solids"
-            )
+        self._brace_step_filepath = filepath
+        self._step_stl_path = stl_path
 
-            # STEP → STL（高精度网格化）
-            stl_path = filepath.replace(".step", "_mesh.stl").replace(".stp", "_mesh.stl")
-            if stl_path == filepath:
-                stl_path = filepath + "_mesh.stl"
-            step_to_stl(filepath, stl_path, linear_deflection=0.05)
+        # 进度对话框
+        self._step_progress = QProgressDialog(
+            "正在从 STEP 加载护具...",
+            "取消", 0, 0, self
+        )
+        self._step_progress.setWindowTitle("STEP 转换")
+        self._step_progress.setWindowModality(Qt.WindowModal)
+        self._step_progress.setMinimumDuration(0)
+        self._step_progress.setValue(0)
+        self._step_progress.show()
 
-            # 用标准流程加载 STL
-            self._brace_step_filepath = filepath
-            self._prepare_and_load(stl_path)
+        # 启动后台线程
+        self._step_worker = FreeCADWorker(filepath, stl_path)
+        self._step_worker.progress.connect(self._step_progress.setLabelText)
+        self._step_worker.finished.connect(self._on_step_conversion_done)
+        self._step_worker.error.connect(self._on_step_conversion_error)
+        self._step_worker.start()
 
-            self.status_bar.showMessage(
-                f"已加载护具 STEP: {Path(filepath).name} "
-                f"(→ {Path(stl_path).name})"
-            )
-        except Exception as e:
-            QMessageBox.critical(self, "加载失败", f"无法加载 STEP 文件:\n{e}")
-            self.status_bar.showMessage("STEP 加载失败")
+    def _on_step_conversion_done(self, stl_path: str):
+        """STEP 转换完成回调"""
+        self._step_progress.close()
+
+        # 清除旧状态
+        self._refresh_inner_highlight()
+        self._inner_cells = None
+        self._inner_regions = []
+        self._inner_vertex_indices = None
+        self._region_actor_map.clear()
+        self.region_list.clear()
+        self.scene.clear_min_max_indicators()
+        self.deformation_state.clear()
+        self.deformation_engine = None
+        self._deformed_inner_vertices = None
+        self._original_inner_vertices = None
+
+        self._prepare_and_load(stl_path)
+
+        self.status_bar.showMessage(
+            f"已加载护具 STEP: {Path(self._brace_step_filepath).name} "
+            f"(→ {Path(stl_path).name})"
+        )
+
+    def _on_step_conversion_error(self, error_msg: str):
+        """STEP 转换错误回调"""
+        self._step_progress.close()
+        QMessageBox.critical(self, "加载失败", f"无法加载 STEP 文件:\n{error_msg}")
+        self.status_bar.showMessage("STEP 加载失败")
 
     def _ensure_deformation_engine(self):
         """确保变形引擎已初始化"""

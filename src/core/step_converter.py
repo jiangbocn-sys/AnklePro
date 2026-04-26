@@ -96,7 +96,7 @@ except Exception as e:
 """
 
 
-def _run_freecad(script: str, timeout: int = 600) -> str:
+def _run_freecad(script: str, timeout: int = 1800) -> str:
     """执行 FreeCAD CLI 脚本，返回 stdout"""
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".py", delete=False
@@ -171,7 +171,7 @@ def step_to_stl(
         angular_deflection=angular_deflection,
     )
 
-    _run_freecad(script)
+    _run_freecad(script, timeout=3600)
     return stl_path
 
 
