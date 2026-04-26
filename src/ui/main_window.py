@@ -1,12 +1,13 @@
 """主窗口 — 包含 3D 视图、控制面板和状态栏"""
 
 import os
+import tempfile
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import vtk
-from PyQt5.QtCore import Qt, QTimer, QEvent, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, QEvent, QThread, pyqtSignal, QProcess
 from PyQt5.QtGui import QColor, QFont
 from PyQt5.QtWidgets import (
     QAction,
@@ -61,60 +62,52 @@ from src.render.interactor_style import BraceCameraInteractorStyle
 
 
 class FreeCADWorker(QThread):
-    """后台线程：执行 FreeCAD STEP→STL 转换（单次 FreeCAD 调用）"""
+    """后台线程：执行 FreeCAD STEP→STL 转换（使用 QProcess 支持取消）"""
     progress = pyqtSignal(str)  # 进度消息
     finished = pyqtSignal(str)  # 输出 STL 路径
     error = pyqtSignal(str)     # 错误信息
 
-    def __init__(self, step_path: str, stl_path: str):
-        super().__init__()
+    FREECAD_CMD = "/Applications/FreeCAD.app/Contents/Resources/bin/freecadcmd"
+
+    def __init__(self, step_path: str, stl_path: str, parent=None):
+        super().__init__(parent)
         self.step_path = step_path
         self.stl_path = stl_path
+        self._process = None
+        self._temp_script = None
+        self._cancelled = False
+
+    def cancel(self):
+        """取消转换，终止 FreeCAD 进程"""
+        self._cancelled = True
+        if self._process and self._process.state() == QProcess.Running:
+            self._process.kill()
 
     def run(self):
-        try:
-            # 合并为单次 FreeCAD 调用，避免重复解析 STEP 文件
-            _run_step_to_stl(self.step_path, self.stl_path,
-                             self.progress.emit)
-            self.finished.emit(self.stl_path)
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-def _run_step_to_stl(step_path: str, stl_path: str,
-                     progress_callback):
-    """单次 FreeCAD 调用完成 STEP→STL，带进度回调"""
-    import subprocess
-    import tempfile
-
-    # 检查缓存：如果 STL 已存在且比 STEP 新，直接跳过
-    if os.path.exists(stl_path):
-        step_mtime = os.path.getmtime(step_path)
-        stl_mtime = os.path.getmtime(stl_path)
-        if stl_mtime >= step_mtime:
-            progress_callback("使用已转换的 STL 缓存")
+        if self._cancelled:
             return
 
-    script = f"""
+        # 检查缓存
+        if os.path.exists(self.stl_path):
+            step_mtime = os.path.getmtime(self.step_path)
+            stl_mtime = os.path.getmtime(self.stl_path)
+            if stl_mtime >= step_mtime:
+                self.progress.emit("使用已转换的 STL 缓存")
+                self.finished.emit(self.stl_path)
+                return
+
+        script = f"""
 import Part, os, FreeCAD, sys
-
-step_path = {step_path!r}
-stl_path = {stl_path!r}
-
+step_path = {self.step_path!r}
+stl_path = {self.stl_path!r}
 try:
-    print('Reading STEP...', flush=True)
     shape = Part.read(step_path)
     doc = FreeCAD.newDocument('StepConvert')
     obj = doc.addObject('Part::Feature', 'Shape')
     obj.Shape = shape
     doc.recompute()
-    print(f'Loaded: {{len(shape.Faces)}} faces, {{len(shape.Edges)}} edges', flush=True)
-
-    print('Meshing to STL...', flush=True)
     shape.tessellate(0.05)
     Part.export([obj], stl_path)
-    size = os.path.getsize(stl_path)
-    print(f'Exported STL: {{size}} bytes', flush=True)
 except Exception as e:
     print(f'ERROR: {{e}}', file=sys.stderr)
     sys.exit(1)
@@ -124,28 +117,54 @@ finally:
     except Exception:
         pass
 """
-    progress_callback("正在读取 STEP 几何...")
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", delete=False
-    ) as f:
-        f.write(script)
-        f.flush()
-        script_path = f.name
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False
+        ) as f:
+            f.write(script)
+            f.flush()
+            self._temp_script = f.name
 
-    try:
-        result = subprocess.run(
-            ["/Applications/FreeCAD.app/Contents/Resources/bin/freecadcmd", script_path],
-            capture_output=True,
-            text=True,
-            timeout=3600,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"FreeCAD 执行失败:\n{result.stderr[-2000:]}"
+        try:
+            self._process = QProcess()
+            self._process.setProcessChannelMode(QProcess.MergedChannels)
+
+            output_lines = []
+
+            def on_ready_read():
+                data = self._process.readAllStandardOutput().data().decode('utf-8', errors='replace')
+                output_lines.append(data)
+                if "Reading" in data or "read" in data.lower():
+                    self.progress.emit("正在读取 STEP 几何...")
+                elif "Meshing" in data or "tessellate" in data:
+                    self.progress.emit("正在网格化导出...")
+
+            self._process.readyReadStandardOutput.connect(on_ready_read)
+
+            self._process.start(
+                self.FREECAD_CMD, [self._temp_script]
             )
-        progress_callback("网格化导出完成，正在加载 STL...")
-    finally:
-        os.unlink(script_path)
+            self._process.waitForFinished(-1)
+
+            if self._cancelled:
+                self.error.emit("用户已取消转换")
+                return
+
+            exit_code = self._process.exitCode()
+            if exit_code != 0:
+                stderr = self._process.readAllStandardError().data().decode(
+                    'utf-8', errors='replace'
+                )
+                raise RuntimeError(
+                    f"FreeCAD 执行失败 (code={exit_code}):\n{stderr[-2000:]}"
+                )
+            self.finished.emit(self.stl_path)
+        except RuntimeError:
+            raise
+        except Exception as e:
+            self.error.emit(str(e))
+        finally:
+            if self._temp_script and os.path.exists(self._temp_script):
+                os.unlink(self._temp_script)
 
 
 class _BraceToStepWorker(QThread):
@@ -158,6 +177,11 @@ class _BraceToStepWorker(QThread):
         super().__init__()
         self.polydata = polydata
         self.stl_path = stl_path
+        self._cancelled = False
+
+    def cancel(self):
+        """取消转换"""
+        self._cancelled = True
 
     def run(self):
         try:
@@ -170,13 +194,22 @@ class _BraceToStepWorker(QThread):
             writer.SetInputData(self.polydata)
             writer.Write()
 
+            if self._cancelled:
+                return
+
             self.progress.emit("正在转换为 STEP...")
             # 2. STL → STEP
             step_path = stl_to_step(temp_stl, tolerance=0.1)
 
+            if self._cancelled:
+                return
+
             self.progress.emit("正在高精度网格化...")
             # 3. STEP → 高精度 STL
             step_to_stl(step_path, self.stl_path, linear_deflection=0.05)
+
+            if self._cancelled:
+                return
 
             # 清理临时文件
             for f in [temp_stl, step_path]:
@@ -185,7 +218,10 @@ class _BraceToStepWorker(QThread):
 
             self.finished.emit(self.stl_path)
         except Exception as e:
-            self.error.emit(str(e))
+            if self._cancelled:
+                self.error.emit("用户已取消转换")
+            else:
+                self.error.emit(str(e))
 
 
 class MainWindow(QMainWindow):
@@ -898,6 +934,7 @@ class MainWindow(QMainWindow):
             self._step_worker = _BraceToStepWorker(
                 self.brace_model.polydata, stl_temp
             )
+            self._step_progress.canceled.connect(self._step_worker.cancel)
             self._step_worker.progress.connect(
                 self._step_progress.setLabelText
             )
@@ -937,6 +974,7 @@ class MainWindow(QMainWindow):
         self._step_progress.show()
 
         self._step_worker = FreeCADWorker(step_path, stl_path)
+        self._step_progress.canceled.connect(self._step_worker.cancel)
         self._step_worker.progress.connect(
             self._step_progress.setLabelText
         )
