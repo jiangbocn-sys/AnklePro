@@ -1,5 +1,6 @@
 """主窗口 — 包含 3D 视图、控制面板和状态栏"""
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -51,6 +52,9 @@ from src.core.surface_picker import (
 )
 from src.core.position_file_manager import PositionFileManager
 from src.core.distance_measurement import DistanceMeasurement
+from src.core.deformation_engine import DeformationEngine, DeformationParams
+from src.core.deformation_state import DeformationState, DeformationStep
+from src.core.step_converter import step_to_stl, stl_to_step, get_step_info
 from src.render.scene_manager import SceneManager
 from src.render.interactor_style import BraceCameraInteractorStyle
 
@@ -102,6 +106,13 @@ class MainWindow(QMainWindow):
 
         # 当前护具文件路径（用于关联位置文件）
         self._current_brace_filepath: Optional[str] = None
+
+        # 尺寸修改
+        self.deformation_state = DeformationState()
+        self.deformation_engine: Optional[DeformationEngine] = None
+        self._original_inner_vertices: Optional[np.ndarray] = None  # 原始内表面顶点位置
+        self._deformed_inner_vertices: Optional[np.ndarray] = None  # 变形后的内表面顶点位置
+        self._brace_step_filepath: Optional[str] = None  # 护具 STEP 文件路径
 
         self._setup_ui()
         self._setup_menu()
@@ -297,6 +308,61 @@ class MainWindow(QMainWindow):
         self.btn_measure.setCheckable(True)
         self.btn_measure.clicked.connect(self._toggle_measurement)
         control_layout.addWidget(self.btn_measure)
+
+        # ---- 护具尺寸修改 ----
+        deform_group = QGroupBox("护具尺寸修改")
+        deform_layout = QVBoxLayout()
+
+        btn_load_step = QPushButton("加载护具 STEP")
+        btn_load_step.clicked.connect(self._load_brace_step)
+        deform_layout.addWidget(btn_load_step)
+
+        # 变形模式选择
+        deform_layout.addWidget(QLabel("变形模式:"))
+        self.deform_mode_combo = QComboBox()
+        self.deform_mode_combo.addItems(["法向调整", "径向缩放", "自适应尺寸", "方向拉伸"])
+        deform_layout.addWidget(self.deform_mode_combo)
+
+        # 变形参数
+        deform_layout.addWidget(QLabel("偏移量 (mm):"))
+        self.spin_deform_offset = QDoubleSpinBox()
+        self.spin_deform_offset.setRange(-20.0, 20.0)
+        self.spin_deform_offset.setSingleStep(0.1)
+        self.spin_deform_offset.setValue(1.0)
+        deform_layout.addWidget(self.spin_deform_offset)
+
+        deform_layout.addWidget(QLabel("衰减半径 (mm, 0=无衰减):"))
+        self.spin_deform_decay = QDoubleSpinBox()
+        self.spin_deform_decay.setRange(0.0, 100.0)
+        self.spin_deform_decay.setSingleStep(1.0)
+        self.spin_deform_decay.setValue(0.0)
+        deform_layout.addWidget(self.spin_deform_decay)
+
+        # 操作按钮
+        deform_btn_row = QHBoxLayout()
+        self.btn_deform_preview = QPushButton("预览")
+        self.btn_deform_preview.clicked.connect(self._preview_deformation)
+        self.btn_deform_apply = QPushButton("应用")
+        self.btn_deform_apply.clicked.connect(self._apply_deformation)
+        self.btn_deform_undo = QPushButton("撤销")
+        self.btn_deform_undo.clicked.connect(self._undo_deformation)
+        deform_btn_row.addWidget(self.btn_deform_preview)
+        deform_btn_row.addWidget(self.btn_deform_apply)
+        deform_btn_row.addWidget(self.btn_deform_undo)
+        deform_layout.addLayout(deform_btn_row)
+
+        # 导出按钮
+        export_btn_row = QHBoxLayout()
+        self.btn_export_stl = QPushButton("导出 STL")
+        self.btn_export_stl.clicked.connect(self._export_stl)
+        self.btn_export_step = QPushButton("导出 STEP")
+        self.btn_export_step.clicked.connect(self._export_step)
+        export_btn_row.addWidget(self.btn_export_stl)
+        export_btn_row.addWidget(self.btn_export_step)
+        deform_layout.addLayout(export_btn_row)
+
+        deform_group.setLayout(deform_layout)
+        control_layout.addWidget(deform_group)
 
         control_layout.addStretch()
         tab_widget.addTab(control_tab, "设置")
@@ -604,6 +670,13 @@ class MainWindow(QMainWindow):
             # 清除旧的距离标示
             self.scene.clear_min_max_indicators()
 
+            # 清除变形状态
+            self.deformation_state.clear()
+            self.deformation_engine = None
+            self._deformed_inner_vertices = None
+            self._original_inner_vertices = None
+            self._brace_step_filepath = None
+
             self.brace_model = load_stl(filepath)
             self.lbl_brace.setText(f"护具模型: {self.brace_model.name}")
             self.brace_transform = TransformManager(
@@ -886,6 +959,268 @@ class MainWindow(QMainWindow):
             min_foot_pos, max_foot_pos,
         )
 
+    # ---- 护具尺寸修改 ----
+
+    def _load_brace_step(self):
+        """从 STEP 文件加载护具"""
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "选择护具 STEP 文件", "", "STEP Files (*.step *.stp)"
+        )
+        if not filepath:
+            return
+
+        try:
+            self.status_bar.showMessage("正在从 STEP 加载护具...")
+            self._render()
+
+            # 获取 STEP 几何信息
+            info = get_step_info(filepath)
+            self.status_bar.showMessage(
+                f"STEP 文件: {info.get('faces', '?')} faces, "
+                f"{info.get('solids', '?')} solids"
+            )
+
+            # STEP → STL（高精度网格化）
+            stl_path = filepath.replace(".step", "_mesh.stl").replace(".stp", "_mesh.stl")
+            if stl_path == filepath:
+                stl_path = filepath + "_mesh.stl"
+            step_to_stl(filepath, stl_path, linear_deflection=0.05)
+
+            # 用标准流程加载 STL
+            self._brace_step_filepath = filepath
+            self._load_brace_from_stl(stl_path)
+
+            self.status_bar.showMessage(
+                f"已加载护具 STEP: {Path(filepath).name} "
+                f"(→ {Path(stl_path).name})"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "加载失败", f"无法加载 STEP 文件:\n{e}")
+            self.status_bar.showMessage("STEP 加载失败")
+
+    def _load_brace_from_stl(self, stl_path: str):
+        """从 STL 文件加载护具（内部方法，供 STEP 转换后调用）"""
+        try:
+            self.brace_model = load_stl(stl_path)
+            self.lbl_brace.setText(f"护具模型: {self.brace_model.name}")
+            self.brace_transform = TransformManager(
+                center=self.brace_model.centroid
+            )
+
+            if self.scene._brace_actor:
+                self.scene.renderer.RemoveActor(self.scene._brace_actor)
+            self.scene.add_brace_model(self.brace_model.polydata)
+
+            if self.foot_model and self.brace_model:
+                self._update_axes()
+            else:
+                self.scene.fit_camera_to_models()
+
+            self._render()
+        except Exception as e:
+            QMessageBox.critical(self, "加载失败", f"无法加载 STL:\n{e}")
+
+    def _ensure_deformation_engine(self):
+        """确保变形引擎已初始化"""
+        if (self.deformation_engine is None
+                and self.foot_model is not None
+                and self.brace_model is not None
+                and self._inner_vertex_indices is not None):
+            self.deformation_engine = DeformationEngine(
+                self.foot_model.polydata,
+                self.brace_model.polydata,
+                self._inner_vertex_indices,
+            )
+            # 保存原始顶点位置
+            pts = self.brace_model.polydata.GetPoints()
+            self._original_inner_vertices = np.array([
+                pts.GetPoint(i) for i in self._inner_vertex_indices
+            ])
+            self._deformed_inner_vertices = self._original_inner_vertices.copy()
+
+    def _get_deformation_params(self) -> DeformationParams:
+        """从 UI 获取当前变形参数"""
+        mode_map = {
+            "法向调整": "normal",
+            "径向缩放": "radial",
+            "自适应尺寸": "adaptive",
+            "方向拉伸": "directional",
+        }
+        mode_str = self.deform_mode_combo.currentText()
+        mode = mode_map.get(mode_str, "normal")
+
+        if self._inner_vertex_indices is None:
+            indices = np.arange(self.brace_model.vertex_count, dtype=np.int64)
+        else:
+            indices = self._inner_vertex_indices.copy()
+
+        return DeformationParams(
+            mode=mode,
+            region_indices=indices,
+            offset_mm=self.spin_deform_offset.value(),
+            scale_factor=1.0 + self.spin_deform_offset.value() / 100.0,
+            decay_radius=self.spin_deform_decay.value(),
+        )
+
+    def _preview_deformation(self):
+        """预览变形效果"""
+        if self.brace_model is None or self._inner_vertex_indices is None:
+            QMessageBox.warning(self, "警告", "请先加载护具并选取内侧面")
+            return
+
+        self._ensure_deformation_engine()
+        if self.deformation_engine is None:
+            QMessageBox.warning(self, "警告", "变形引擎初始化失败")
+            return
+
+        params = self._get_deformation_params()
+        deformed = self.deformation_engine.apply(
+            self._deformed_inner_vertices, params
+        )
+
+        # 更新 polydata 顶点
+        self._apply_vertex_update(deformed)
+        self._render()
+        self.status_bar.showMessage(
+            f"预览: 模式={params.mode}, 偏移={params.offset_mm:+.1f}mm"
+        )
+
+    def _apply_deformation(self):
+        """应用变形并记录到历史"""
+        if self.brace_model is None or self._inner_vertex_indices is None:
+            QMessageBox.warning(self, "警告", "请先加载护具并选取内侧面")
+            return
+
+        self._ensure_deformation_engine()
+        if self.deformation_engine is None:
+            return
+
+        params = self._get_deformation_params()
+        before = self._deformed_inner_vertices.copy()
+        after = self.deformation_engine.apply(
+            self._deformed_inner_vertices, params
+        )
+
+        # 记录变形步骤
+        step = DeformationStep(
+            mode=params.mode,
+            offset_mm=params.offset_mm,
+            scale_factor=params.scale_factor,
+            decay_radius=params.decay_radius,
+            direction=(
+                params.direction.tolist() if params.direction is not None else None
+            ),
+            center_point=(
+                params.center_point.tolist() if params.center_point is not None else None
+            ),
+            region_indices=params.region_indices.tolist(),
+        )
+        self.deformation_state.push(step)
+
+        self._deformed_inner_vertices = after
+        self._apply_vertex_update(after)
+        self._render()
+
+        # 如果有距离计算，重新计算
+        if self.current_distances is not None:
+            self._compute_distance()
+
+        self.status_bar.showMessage(
+            f"已应用变形 (共 {self.deformation_state.step_count} 步)"
+        )
+
+    def _undo_deformation(self):
+        """撤销上一步变形"""
+        if self.deformation_state.step_count == 0:
+            self.status_bar.showMessage("没有可撤销的操作")
+            return
+
+        self.deformation_state.undo()
+
+        # 从头重新应用所有变形
+        self._replay_deformations()
+        self._render()
+        self.status_bar.showMessage(
+            f"已撤销 (剩余 {self.deformation_state.step_count} 步)"
+        )
+
+    def _replay_deformations(self):
+        """从头重新应用所有变形步骤"""
+        if self._original_inner_vertices is None:
+            return
+        if self.deformation_engine is None:
+            return
+
+        self._deformed_inner_vertices = self._original_inner_vertices.copy()
+        for params in self.deformation_state.get_params_list():
+            self._deformed_inner_vertices = self.deformation_engine.apply(
+                self._deformed_inner_vertices, params
+            )
+        self._apply_vertex_update(self._deformed_inner_vertices)
+
+    def _apply_vertex_update(self, deformed_vertices: np.ndarray):
+        """将变形后的顶点更新到 VTK polydata 并刷新场景"""
+        if self.brace_model is None:
+            return
+
+        pts = self.brace_model.polydata.GetPoints()
+        for i, idx in enumerate(self._inner_vertex_indices):
+            pts.SetPoint(int(idx), deformed_vertices[i].tolist())
+        pts.Modified()
+        self.brace_model.polydata.Modified()
+
+    def _export_stl(self):
+        """导出当前护具为 STL"""
+        if self.brace_model is None:
+            QMessageBox.warning(self, "警告", "请先加载护具")
+            return
+
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "导出 STL", "", "STL Files (*.stl)"
+        )
+        if not filepath:
+            return
+
+        try:
+            writer = vtk.vtkSTLWriter()
+            writer.SetFileName(filepath)
+            writer.SetInputData(self.brace_model.polydata)
+            writer.Write()
+            self.status_bar.showMessage(f"已导出 STL: {Path(filepath).name}")
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"无法导出 STL:\n{e}")
+
+    def _export_step(self):
+        """导出当前护具为 STEP（通过 STL → STEP 转换）"""
+        if self.brace_model is None:
+            QMessageBox.warning(self, "警告", "请先加载护具")
+            return
+
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "导出 STEP", "", "STEP Files (*.step *.stp)"
+        )
+        if not filepath:
+            return
+
+        try:
+            # 先导出为临时 STL
+            temp_stl = filepath + ".temp.stl"
+            writer = vtk.vtkSTLWriter()
+            writer.SetFileName(temp_stl)
+            writer.SetInputData(self.brace_model.polydata)
+            writer.Write()
+
+            # STL → STEP
+            stl_to_step(temp_stl, filepath, tolerance=0.1)
+
+            # 清理临时文件
+            if os.path.exists(temp_stl):
+                os.unlink(temp_stl)
+
+            self.status_bar.showMessage(f"已导出 STEP: {Path(filepath).name}")
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"无法导出 STEP:\n{e}")
+
     def _reset_transform(self):
         """重置护具变换"""
         self.brace_transform.reset()
@@ -894,6 +1229,11 @@ class MainWindow(QMainWindow):
         self.scene.clear_min_max_indicators()
         self.current_distances = None
         self.stats_text.clear()
+
+        # 清除变形状态
+        self.deformation_state.clear()
+        self._deformed_inner_vertices = None
+        self._original_inner_vertices = None
 
         # 清除内侧面高亮和状态
         self._refresh_inner_highlight()
