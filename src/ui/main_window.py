@@ -61,7 +61,7 @@ from src.render.interactor_style import BraceCameraInteractorStyle
 
 
 class FreeCADWorker(QThread):
-    """后台线程：执行 FreeCAD STEP→STL 转换"""
+    """后台线程：执行 FreeCAD STEP→STL 转换（单次 FreeCAD 调用）"""
     progress = pyqtSignal(str)  # 进度消息
     finished = pyqtSignal(str)  # 输出 STL 路径
     error = pyqtSignal(str)     # 错误信息
@@ -73,13 +73,79 @@ class FreeCADWorker(QThread):
 
     def run(self):
         try:
-            self.progress.emit("正在解析 STEP 几何...")
-            get_step_info(self.step_path)
-            self.progress.emit("正在进行网格化转换 (可能需要几分钟)...")
-            step_to_stl(self.step_path, self.stl_path, linear_deflection=0.05)
+            # 合并为单次 FreeCAD 调用，避免重复解析 STEP 文件
+            _run_step_to_stl(self.step_path, self.stl_path,
+                             self.progress.emit)
             self.finished.emit(self.stl_path)
         except Exception as e:
             self.error.emit(str(e))
+
+
+def _run_step_to_stl(step_path: str, stl_path: str,
+                     progress_callback):
+    """单次 FreeCAD 调用完成 STEP→STL，带进度回调"""
+    import subprocess
+    import tempfile
+
+    # 检查缓存：如果 STL 已存在且比 STEP 新，直接跳过
+    if os.path.exists(stl_path):
+        step_mtime = os.path.getmtime(step_path)
+        stl_mtime = os.path.getmtime(stl_path)
+        if stl_mtime >= step_mtime:
+            progress_callback("使用已转换的 STL 缓存")
+            return
+
+    script = f"""
+import Part, os, FreeCAD, sys
+
+step_path = {step_path!r}
+stl_path = {stl_path!r}
+
+try:
+    print('Reading STEP...', flush=True)
+    shape = Part.read(step_path)
+    doc = FreeCAD.newDocument('StepConvert')
+    obj = doc.addObject('Part::Feature', 'Shape')
+    obj.Shape = shape
+    doc.recompute()
+    print(f'Loaded: {{len(shape.Faces)}} faces, {{len(shape.Edges)}} edges', flush=True)
+
+    print('Meshing to STL...', flush=True)
+    shape.tessellate(0.05)
+    Part.export([obj], stl_path)
+    size = os.path.getsize(stl_path)
+    print(f'Exported STL: {{size}} bytes', flush=True)
+except Exception as e:
+    print(f'ERROR: {{e}}', file=sys.stderr)
+    sys.exit(1)
+finally:
+    try:
+        FreeCAD.closeDocument(doc.Name)
+    except Exception:
+        pass
+"""
+    progress_callback("正在读取 STEP 几何...")
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".py", delete=False
+    ) as f:
+        f.write(script)
+        f.flush()
+        script_path = f.name
+
+    try:
+        result = subprocess.run(
+            ["/Applications/FreeCAD.app/Contents/Resources/bin/freecadcmd", script_path],
+            capture_output=True,
+            text=True,
+            timeout=3600,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"FreeCAD 执行失败:\n{result.stderr[-2000:]}"
+            )
+        progress_callback("网格化导出完成，正在加载 STL...")
+    finally:
+        os.unlink(script_path)
 
 
 class MainWindow(QMainWindow):
