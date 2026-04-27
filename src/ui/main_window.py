@@ -275,6 +275,7 @@ class MainWindow(QMainWindow):
         # 尺寸修改
         self.deformation_state = DeformationState()
         self.deformation_engine: Optional[DeformationEngine] = None
+        self._deform_direction = "shrink"  # "shrink" or "expand"
         self._original_inner_vertices: Optional[np.ndarray] = None  # 原始内表面顶点位置
         self._deformed_inner_vertices: Optional[np.ndarray] = None  # 变形后的内表面顶点位置
         self._brace_step_filepath: Optional[str] = None  # 护具 STEP 文件路径
@@ -496,20 +497,38 @@ class MainWindow(QMainWindow):
         step_load_group.setLayout(step_load_layout)
         deform_layout.addWidget(step_load_group)
 
-        # 变形模式选择
-        deform_layout.addWidget(QLabel("变形模式:"))
-        self.deform_mode_combo = QComboBox()
-        self.deform_mode_combo.addItems(["法向调整", "径向缩放", "自适应尺寸", "方向拉伸"])
-        deform_layout.addWidget(self.deform_mode_combo)
+        # 变形区域选择提示
+        self.lbl_deform_region = QLabel("变形区域：请先在「模型」标签页选取内侧面并勾选区域")
+        self.lbl_deform_region.setWordWrap(True)
+        deform_layout.addWidget(self.lbl_deform_region)
 
-        # 变形参数
+        # 变形方向和偏移量
+        direction_group = QGroupBox("变形方向")
+        direction_layout = QHBoxLayout()
+
+        self.btn_shrink = QPushButton("向内收缩")
+        self.btn_shrink.setCheckable(True)
+        self.btn_shrink.setChecked(True)
+        self.btn_shrink.clicked.connect(lambda: self._set_deform_direction("shrink"))
+
+        self.btn_expand = QPushButton("向外扩张")
+        self.btn_expand.setCheckable(True)
+        self.btn_expand.clicked.connect(lambda: self._set_deform_direction("expand"))
+
+        direction_layout.addWidget(self.btn_shrink)
+        direction_layout.addWidget(self.btn_expand)
+        direction_group.setLayout(direction_layout)
+        deform_layout.addWidget(direction_group)
+
+        # 偏移量
         deform_layout.addWidget(QLabel("偏移量 (mm):"))
         self.spin_deform_offset = QDoubleSpinBox()
-        self.spin_deform_offset.setRange(-20.0, 20.0)
+        self.spin_deform_offset.setRange(0.01, 20.0)
         self.spin_deform_offset.setSingleStep(0.1)
         self.spin_deform_offset.setValue(1.0)
         deform_layout.addWidget(self.spin_deform_offset)
 
+        # 衰减半径
         deform_layout.addWidget(QLabel("衰减半径 (mm, 0=无衰减):"))
         self.spin_deform_decay = QDoubleSpinBox()
         self.spin_deform_decay.setRange(0.0, 100.0)
@@ -1235,6 +1254,12 @@ class MainWindow(QMainWindow):
 
     # ---- 护具尺寸修改 ----
 
+    def _set_deform_direction(self, direction: str):
+        """设置变形方向"""
+        self._deform_direction = direction
+        self.btn_shrink.setChecked(direction == "shrink")
+        self.btn_expand.setChecked(direction == "expand")
+
     def _load_brace_step(self):
         """从 STEP 文件加载护具"""
         filepath, _ = QFileDialog.getOpenFileName(
@@ -1293,28 +1318,59 @@ class MainWindow(QMainWindow):
             self._deformed_inner_vertices = self._original_inner_vertices.copy()
 
     def _get_deformation_params(self) -> DeformationParams:
-        """从 UI 获取当前变形参数"""
-        mode_map = {
-            "法向调整": "normal",
-            "径向缩放": "radial",
-            "自适应尺寸": "adaptive",
-            "方向拉伸": "directional",
-        }
-        mode_str = self.deform_mode_combo.currentText()
-        mode = mode_map.get(mode_str, "normal")
+        """从 UI 获取当前变形参数（基于用户勾选的区域）"""
+        # 获取用户勾选的区域顶点索引
+        selected_vertex_indices = self._get_selected_region_indices()
 
-        if self._inner_vertex_indices is None:
-            indices = np.arange(self.brace_model.vertex_count, dtype=np.int64)
-        else:
-            indices = self._inner_vertex_indices.copy()
+        if selected_vertex_indices is None or len(selected_vertex_indices) == 0:
+            # 没有勾选区域，使用全部内表面
+            selected_vertex_indices = np.arange(
+                len(self._inner_vertex_indices), dtype=np.int64
+            )
+
+        # 方向：shrink = 向内（正偏移），expand = 向外（负偏移）
+        offset = self.spin_deform_offset.value()
+        if self._deform_direction == "expand":
+            offset = -offset
 
         return DeformationParams(
-            mode=mode,
-            region_indices=indices,
-            offset_mm=self.spin_deform_offset.value(),
-            scale_factor=1.0 + self.spin_deform_offset.value() / 100.0,
+            mode="normal",
+            region_indices=selected_vertex_indices,
+            offset_mm=offset,
+            scale_factor=1.0 + offset / 100.0,
             decay_radius=self.spin_deform_decay.value(),
         )
+
+    def _get_selected_region_indices(self) -> Optional[np.ndarray]:
+        """获取用户勾选区域的顶点索引（相对于内表面数组的 0..N-1 索引）"""
+        if not self._inner_regions or self._inner_vertex_indices is None:
+            return None
+
+        # 收集所有勾选区域的 cell 索引
+        selected_cells = set()
+        for i in range(self.region_list.count()):
+            item = self.region_list.item(i)
+            if item.checkState() == Qt.Checked:
+                region_idx, _ = item.data(Qt.UserRole)
+                selected_cells.update(self._inner_regions[region_idx].tolist())
+
+        if not selected_cells:
+            return None
+
+        # 从选中的 cell 中提取顶点索引
+        selected_vertex_set = set()
+        for cell_id in selected_cells:
+            cell = self.brace_model.polydata.GetCell(cell_id)
+            for j in range(cell.GetNumberOfPoints()):
+                selected_vertex_set.add(cell.GetPointId(j))
+
+        # 将原始网格索引映射到内表面数组索引（0..N-1）
+        index_map = {idx: i for i, idx in enumerate(self._inner_vertex_indices)}
+        mapped_indices = np.array(
+            sorted(index_map[v] for v in selected_vertex_set if v in index_map),
+            dtype=np.int64,
+        )
+        return mapped_indices if len(mapped_indices) > 0 else None
 
     def _preview_deformation(self):
         """预览变形效果"""
@@ -1328,6 +1384,9 @@ class MainWindow(QMainWindow):
             return
 
         params = self._get_deformation_params()
+        n_regions = len(params.region_indices)
+        direction_label = "向内收缩" if params.offset_mm > 0 else "向外扩张"
+
         deformed = self.deformation_engine.apply(
             self._deformed_inner_vertices, params
         )
@@ -1336,7 +1395,8 @@ class MainWindow(QMainWindow):
         self._apply_vertex_update(deformed)
         self._render()
         self.status_bar.showMessage(
-            f"预览: 模式={params.mode}, 偏移={params.offset_mm:+.1f}mm"
+            f"预览: {direction_label} {abs(params.offset_mm):.1f}mm, "
+            f"区域顶点数 {n_regions:,}"
         )
 
     def _apply_deformation(self):
@@ -1379,8 +1439,11 @@ class MainWindow(QMainWindow):
         if self.current_distances is not None:
             self._compute_distance()
 
+        direction_label = "向内收缩" if params.offset_mm > 0 else "向外扩张"
+        n_regions = len(params.region_indices)
         self.status_bar.showMessage(
-            f"已应用变形 (共 {self.deformation_state.step_count} 步)"
+            f"已应用{direction_label} {abs(params.offset_mm):.1f}mm "
+            f"(区域 {n_regions:,} 顶点, 共 {self.deformation_state.step_count} 步)"
         )
 
     def _undo_deformation(self):

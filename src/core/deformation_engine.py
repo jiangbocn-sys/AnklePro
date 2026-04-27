@@ -50,19 +50,45 @@ class DeformationEngine:
         polydata: vtk.vtkPolyData,
         indices: np.ndarray,
     ) -> np.ndarray:
-        """计算指定顶点的法线向量"""
+        """计算指定顶点的法线向量
+
+        使用网格质心校正法线方向，确保内表面法线一致朝向足部（向内）。
+        """
         pts = polydata.GetPoints()
         n = len(indices)
-        normals = np.zeros((n, 3), dtype=np.float64)
-        polydata.ComputePointNormals()
-        vtk_normals = polydata.GetPointData().GetNormals()
 
+        # 使用 vtkPolyDataNormals 计算原始法线
+        norm_filter = vtk.vtkPolyDataNormals()
+        norm_filter.SetInputData(polydata)
+        norm_filter.ComputePointNormalsOn()
+        norm_filter.ComputeCellNormalsOff()
+        norm_filter.ConsistencyOn()
+        norm_filter.SplittingOff()
+        norm_filter.Update()
+
+        vtk_normals = norm_filter.GetOutput().GetPointData().GetNormals()
+
+        # 用质心校正法线方向：内表面法线应朝向质心（向内）
+        centroid = np.zeros(3, dtype=np.float64)
+        for i in range(n):
+            idx = int(indices[i])
+            centroid += np.array(pts.GetPoint(idx))
+        centroid /= n
+
+        normals = np.zeros((n, 3), dtype=np.float64)
         for i, idx in enumerate(indices):
+            idx = int(idx)
             if vtk_normals:
-                normals[i] = np.array(vtk_normals.GetTuple(idx))
+                raw_normal = np.array(vtk_normals.GetTuple(idx))
             else:
-                # 无预设法线时用最近点方向估计
-                normals[i] = np.array(pts.GetPoint(idx))
+                raw_normal = np.array(pts.GetPoint(idx)) - centroid
+
+            # 校正法线方向：确保朝向质心（向内）
+            to_centroid = centroid - np.array(pts.GetPoint(idx))
+            if np.dot(raw_normal, to_centroid) < 0:
+                raw_normal = -raw_normal  # 翻转，使法线朝向质心
+
+            normals[i] = raw_normal
 
         # 归一化
         norms = np.linalg.norm(normals, axis=1, keepdims=True)
