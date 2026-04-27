@@ -536,6 +536,14 @@ class MainWindow(QMainWindow):
         self.spin_deform_decay.setValue(0.0)
         deform_layout.addWidget(self.spin_deform_decay)
 
+        # 边界平滑半径
+        self.spin_boundary_smooth = QDoubleSpinBox()
+        self.spin_boundary_smooth.setRange(0.0, 50.0)
+        self.spin_boundary_smooth.setSingleStep(1.0)
+        self.spin_boundary_smooth.setValue(5.0)
+        deform_layout.addWidget(QLabel("边界平滑 (mm, 0=不平滑):"))
+        deform_layout.addWidget(self.spin_boundary_smooth)
+
         # 操作按钮
         deform_btn_row = QHBoxLayout()
         self.btn_deform_preview = QPushButton("预览")
@@ -1339,6 +1347,7 @@ class MainWindow(QMainWindow):
             offset_mm=offset,
             scale_factor=1.0 + offset / 100.0,
             decay_radius=self.spin_deform_decay.value(),
+            boundary_smooth=self.spin_boundary_smooth.value(),
         )
 
     def _get_selected_region_indices(self) -> Optional[np.ndarray]:

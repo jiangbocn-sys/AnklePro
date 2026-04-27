@@ -15,6 +15,7 @@ class DeformationParams:
     offset_mm: float = 0.0  # 偏移量 (mm)，正=放大，负=缩小
     scale_factor: float = 1.0  # 缩放因子
     decay_radius: float = 0.0  # 衰减半径 (mm)，0 = 无衰减
+    boundary_smooth: float = 0.0  # 边界平滑半径 (mm)，0 = 不平滑
     direction: np.ndarray = None  # 自定义拉伸方向 (仅 directional 模式)
     center_point: np.ndarray = None  # 变形中心点
 
@@ -113,6 +114,69 @@ class DeformationEngine:
         distances = np.linalg.norm(vertices - center, axis=1)
         ratio = distances / decay_radius
         weights = np.maximum(0.0, 1.0 - ratio) ** 2
+        return weights
+
+    def _compute_region_weights(
+        self,
+        n_total: int,
+        region_indices: np.ndarray,
+        boundary_smooth: float,
+    ) -> np.ndarray:
+        """
+        计算基于网格的边界平滑权重
+
+        1. 区域内顶点权重=1
+        2. 区域外顶点在 smooth 半径内平滑衰减到 0（基于欧氏距离近似）
+        """
+        if boundary_smooth <= 0:
+            weights = np.zeros(n_total, dtype=np.float64)
+            weights[region_indices] = 1.0
+            return weights
+
+        weights = np.zeros(n_total, dtype=np.float64)
+        weights[region_indices] = 1.0
+
+        # 获取所有内表面顶点和区域顶点坐标
+        all_verts = np.array([
+            self.brace_polydata.GetPoints().GetPoint(int(i))
+            for i in self.inner_indices
+        ])
+        region_verts = all_verts[region_indices]
+
+        # 找非区域顶点
+        region_set = set(region_indices.tolist())
+        non_region = [i for i in range(n_total) if i not in region_set]
+
+        if non_region:
+            non_region_arr = np.array(non_region)
+            non_region_verts = all_verts[non_region_arr]
+
+            # 批量计算每个非区域顶点到区域顶点的最小距离
+            # 使用逐块计算避免大矩阵
+            block_size = 2000
+            for start in range(0, len(non_region_arr), block_size):
+                end = min(start + block_size, len(non_region_arr))
+                batch = non_region_verts[start:end]
+
+                # 计算 batch 中每个点到 region_verts 的最小距离
+                # 如果 region 太大也用分块
+                min_dists = np.full(len(batch), np.inf)
+                r_block = 5000
+                for r_start in range(0, len(region_verts), r_block):
+                    r_end = min(r_start + r_block, len(region_verts))
+                    r_batch = region_verts[r_start:r_end]
+                    # (batch, 1, 3) - (1, r_batch, 3) -> (batch, r_batch)
+                    diffs = batch[:, np.newaxis, :] - r_batch[np.newaxis, :, :]
+                    dists = np.linalg.norm(diffs, axis=2)
+                    batch_min = np.min(dists, axis=1)
+                    min_dists = np.minimum(min_dists, batch_min)
+
+                # 应用二次衰减
+                for k, d in enumerate(min_dists):
+                    if d < boundary_smooth:
+                        idx = non_region_arr[start + k]
+                        weights[idx] = (1.0 - d / boundary_smooth) ** 2
+
         return weights
 
     def _find_closest_foot_points(
@@ -228,24 +292,30 @@ class DeformationEngine:
         v' = v + offset * normal(v) * weight(distance)
         """
         result = vertices.copy()
-        indices = params.region_indices
-        selected = vertices[indices]
-        selected_normals = self._normals[indices]
+
+        # 计算区域权重（含边界平滑）
+        region_weights = self._compute_region_weights(
+            len(vertices), params.region_indices, params.boundary_smooth
+        )
 
         if params.center_point is None:
             center = np.mean(vertices, axis=0)
         else:
             center = params.center_point
 
-        weights = self._compute_weights(
-            selected, center, params.decay_radius
-        )
+        # 计算中心衰减权重
+        if params.decay_radius > 0:
+            center_weights = self._compute_weights(vertices, center, params.decay_radius)
+        else:
+            center_weights = np.ones(len(vertices), dtype=np.float64)
 
-        for i in range(len(indices)):
-            w = weights[i]
-            result[indices[i]] += (
-                params.offset_mm * selected_normals[i] * w
-            )
+        # 组合权重 = 区域权重 * 中心衰减
+        final_weights = region_weights * center_weights
+
+        # 只对有权重的顶点进行变形
+        active = final_weights > 0
+        for i in np.where(active)[0]:
+            result[i] += params.offset_mm * self._normals[i] * final_weights[i]
 
         return result
 
