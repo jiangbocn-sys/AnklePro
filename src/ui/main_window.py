@@ -278,6 +278,7 @@ class MainWindow(QMainWindow):
         self._deform_direction = "shrink"  # "shrink" or "expand"
         self._original_inner_vertices: Optional[np.ndarray] = None  # 原始内表面顶点位置
         self._deformed_inner_vertices: Optional[np.ndarray] = None  # 变形后的内表面顶点位置
+        self._preview_vertices: Optional[np.ndarray] = None  # 当前预览的顶点位置
         self._brace_step_filepath: Optional[str] = None  # 护具 STEP 文件路径
 
         self._setup_ui()
@@ -550,10 +551,13 @@ class MainWindow(QMainWindow):
         self.btn_deform_preview.clicked.connect(self._preview_deformation)
         self.btn_deform_apply = QPushButton("应用")
         self.btn_deform_apply.clicked.connect(self._apply_deformation)
+        self.btn_deform_revert = QPushButton("还原")
+        self.btn_deform_revert.clicked.connect(self._revert_preview)
         self.btn_deform_undo = QPushButton("撤销")
         self.btn_deform_undo.clicked.connect(self._undo_deformation)
         deform_btn_row.addWidget(self.btn_deform_preview)
         deform_btn_row.addWidget(self.btn_deform_apply)
+        deform_btn_row.addWidget(self.btn_deform_revert)
         deform_btn_row.addWidget(self.btn_deform_undo)
         deform_layout.addLayout(deform_btn_row)
 
@@ -1327,16 +1331,15 @@ class MainWindow(QMainWindow):
 
     def _get_deformation_params(self) -> DeformationParams:
         """从 UI 获取当前变形参数（基于用户勾选的区域）"""
-        # 获取用户勾选的区域顶点索引
         selected_vertex_indices = self._get_selected_region_indices()
 
         if selected_vertex_indices is None or len(selected_vertex_indices) == 0:
-            # 没有勾选区域，使用全部内表面
-            selected_vertex_indices = np.arange(
-                len(self._inner_vertex_indices), dtype=np.int64
+            QMessageBox.warning(
+                self, "警告",
+                "请先在「模型」标签页的「内侧面区域」列表中勾选要变形的区域"
             )
+            return None
 
-        # 方向：shrink = 向内（正偏移），expand = 向外（负偏移）
         offset = self.spin_deform_offset.value()
         if self._deform_direction == "expand":
             offset = -offset
@@ -1382,7 +1385,7 @@ class MainWindow(QMainWindow):
         return mapped_indices if len(mapped_indices) > 0 else None
 
     def _preview_deformation(self):
-        """预览变形效果"""
+        """预览变形效果（不提交到历史）"""
         if self.brace_model is None or self._inner_vertex_indices is None:
             QMessageBox.warning(self, "警告", "请先加载护具并在「模型」标签页选取内侧面")
             return
@@ -1392,54 +1395,45 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "警告", "变形引擎初始化失败")
             return
 
-        # 检查是否有勾选的区域
-        checked_indices = self._get_selected_region_indices()
-        if checked_indices is None:
-            # 没有勾选区域，确认用户是否要对全部内表面变形
-            reply = QMessageBox.question(
-                self, "确认",
-                "未勾选任何区域，将对全部内表面应用变形。\n"
-                "请在「模型」标签页的「内侧面区域」列表中勾选要变形的区域。\n"
-                "是否继续？",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if reply == QMessageBox.No:
-                return
-
         params = self._get_deformation_params()
-        n_regions = len(params.region_indices)
-        direction_label = "向内收缩" if params.offset_mm > 0 else "向外扩张"
+        if params is None:
+            return
 
         deformed = self.deformation_engine.apply(
             self._deformed_inner_vertices, params
         )
+        self._preview_vertices = deformed
 
-        # 更新 polydata 顶点
         self._apply_vertex_update(deformed)
         self._render()
+
+        direction_label = "向内收缩" if params.offset_mm > 0 else "向外扩张"
         self.status_bar.showMessage(
-            f"预览: {direction_label} {abs(params.offset_mm):.1f}mm, "
-            f"变形 {n_regions:,} 顶点"
+            f"预览: {direction_label} {abs(params.offset_mm):.1f}mm — "
+            f"满意后点击「应用」提交，或点击「还原」取消"
         )
 
     def _apply_deformation(self):
-        """应用变形并记录到历史"""
+        """提交预览变形到历史，或直接应用"""
         if self.brace_model is None or self._inner_vertex_indices is None:
-            QMessageBox.warning(self, "警告", "请先加载护具并选取内侧面")
+            QMessageBox.warning(self, "警告", "请先加载护具并在「模型」标签页选取内侧面")
             return
 
         self._ensure_deformation_engine()
         if self.deformation_engine is None:
             return
 
-        params = self._get_deformation_params()
-        before = self._deformed_inner_vertices.copy()
-        after = self.deformation_engine.apply(
-            self._deformed_inner_vertices, params
-        )
+        if self._preview_vertices is not None:
+            final = self._preview_vertices
+            params = self._get_deformation_params()
+        else:
+            params = self._get_deformation_params()
+            if params is None:
+                return
+            final = self.deformation_engine.apply(
+                self._deformed_inner_vertices, params
+            )
 
-        # 记录变形步骤
         step = DeformationStep(
             mode=params.mode,
             offset_mm=params.offset_mm,
@@ -1454,12 +1448,11 @@ class MainWindow(QMainWindow):
             region_indices=params.region_indices.tolist(),
         )
         self.deformation_state.push(step)
+        self._deformed_inner_vertices = final.copy()
+        self._preview_vertices = None
 
-        self._deformed_inner_vertices = after
-        self._apply_vertex_update(after)
         self._render()
 
-        # 如果有距离计算，重新计算
         if self.current_distances is not None:
             self._compute_distance()
 
@@ -1469,6 +1462,19 @@ class MainWindow(QMainWindow):
             f"已应用{direction_label} {abs(params.offset_mm):.1f}mm "
             f"(区域 {n_regions:,} 顶点, 共 {self.deformation_state.step_count} 步)"
         )
+
+    def _revert_preview(self):
+        """还原预览，回到变形前的状态"""
+        if self._preview_vertices is None and self.deformation_state.step_count == 0:
+            self.status_bar.showMessage("当前没有可还原的操作")
+            return
+
+        self._preview_vertices = None
+
+        # 重新应用所有已提交的变形步骤
+        self._replay_deformations()
+        self._render()
+        self.status_bar.showMessage("已还原预览，回到变形前状态")
 
     def _undo_deformation(self):
         """撤销上一步变形"""
