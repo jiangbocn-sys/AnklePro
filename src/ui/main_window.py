@@ -523,9 +523,9 @@ class MainWindow(QMainWindow):
         # 偏移量
         deform_layout.addWidget(QLabel("偏移量 (mm):"))
         self.spin_deform_offset = QDoubleSpinBox()
-        self.spin_deform_offset.setRange(0.01, 20.0)
-        self.spin_deform_offset.setSingleStep(0.1)
-        self.spin_deform_offset.setValue(1.0)
+        self.spin_deform_offset.setRange(0.1, 20.0)
+        self.spin_deform_offset.setSingleStep(0.5)
+        self.spin_deform_offset.setValue(5.0)
         deform_layout.addWidget(self.spin_deform_offset)
 
         # 衰减半径
@@ -1384,13 +1384,28 @@ class MainWindow(QMainWindow):
     def _preview_deformation(self):
         """预览变形效果"""
         if self.brace_model is None or self._inner_vertex_indices is None:
-            QMessageBox.warning(self, "警告", "请先加载护具并选取内侧面")
+            QMessageBox.warning(self, "警告", "请先加载护具并在「模型」标签页选取内侧面")
             return
 
         self._ensure_deformation_engine()
         if self.deformation_engine is None:
             QMessageBox.warning(self, "警告", "变形引擎初始化失败")
             return
+
+        # 检查是否有勾选的区域
+        checked_indices = self._get_selected_region_indices()
+        if checked_indices is None:
+            # 没有勾选区域，确认用户是否要对全部内表面变形
+            reply = QMessageBox.question(
+                self, "确认",
+                "未勾选任何区域，将对全部内表面应用变形。\n"
+                "请在「模型」标签页的「内侧面区域」列表中勾选要变形的区域。\n"
+                "是否继续？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply == QMessageBox.No:
+                return
 
         params = self._get_deformation_params()
         n_regions = len(params.region_indices)
@@ -1405,7 +1420,7 @@ class MainWindow(QMainWindow):
         self._render()
         self.status_bar.showMessage(
             f"预览: {direction_label} {abs(params.offset_mm):.1f}mm, "
-            f"区域顶点数 {n_regions:,}"
+            f"变形 {n_regions:,} 顶点"
         )
 
     def _apply_deformation(self):
