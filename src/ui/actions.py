@@ -1346,13 +1346,8 @@ class ActionsMixin:
         self.stats_text.clear()
         self.region_list.clear()
 
-        # 重置 UI 坐标显示
-        self.lbl_tx.setText("X = 0.0mm")
-        self.lbl_ty.setText("Y = 0.0mm")
-        self.lbl_tz.setText("Z = 0.0mm")
-        self.lbl_rx.setText("Rx = 0.0°")
-        self.lbl_ry.setText("Ry = 0.0°")
-        self.lbl_rz.setText("Rz = 0.0°")
+        # 重置 UI 坐标显示（复用 _update_coord_display）
+        self._update_coord_display()
 
         # 重置相机
         self.scene.reset_camera()
