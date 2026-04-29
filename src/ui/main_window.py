@@ -2103,6 +2103,9 @@ class MainWindow(QMainWindow):
 
     def _clear_workspace(self):
         """清除所有模型和状态，回到初始状态以便加载新模型"""
+        # 清除内侧面高亮（包含 region actors 和 scene actors）
+        self._refresh_inner_highlight()
+
         # 从场景中移除模型
         if self.scene._foot_actor:
             self.scene.renderer.RemoveActor(self.scene._foot_actor)
@@ -2114,7 +2117,6 @@ class MainWindow(QMainWindow):
         # 清除所有可视化元素
         self.scene.clear_distance_colors()
         self.scene.clear_min_max_indicators()
-        self.scene.clear_inner_surface_actors()
         self.scene.hide_deform_point_marker()
 
         # 重置所有模型和状态
@@ -2139,14 +2141,18 @@ class MainWindow(QMainWindow):
         self._preview_vertices = None
         self._deform_point_idx = -1
 
+        # 清除保存的位置
+        self.saved_positions = [None] * 5
+        self._refresh_position_list()
+        self._current_brace_filepath = None
+        self._brace_step_filepath = None
+
         # 清除 UI 状态
         self.lbl_foot.setText("足部模型: 未加载")
         self.lbl_brace.setText("护具模型: 未加载")
         self.lbl_vertices.setText("顶点数: -")
         self.stats_text.clear()
         self.region_list.clear()
-        self._current_brace_filepath = None
-        self._brace_step_filepath = None
 
         # 重置相机
         self.scene.reset_camera()
