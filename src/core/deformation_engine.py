@@ -1,4 +1,12 @@
-"""变形引擎 — 对护具网格顶点应用尺寸修改"""
+"""变形引擎 — 对护具网格顶点应用尺寸修改
+
+核心思路：
+内表面是一个连续的弹性曲面。变形时不应让每个顶点沿自己的法线
+独立移动（法线方向各异导致边缘撕裂），而应使用统一的位移方向场，
+配合空间衰减权重实现平滑过渡。
+
+类比：用手指按橡胶薄膜——薄膜整体鼓起，相邻区域平滑过渡，不会出现折痕。
+"""
 
 from dataclasses import dataclass
 from typing import Optional
@@ -10,7 +18,7 @@ import vtk
 @dataclass
 class DeformationParams:
     """变形参数"""
-    mode: str  # "adaptive", "radial", "normal", "directional"
+    mode: str  # "normal", "radial", "adaptive", "directional"
     region_indices: np.ndarray  # 受影响的顶点索引
     offset_mm: float = 0.0  # 偏移量 (mm)，正=放大，负=缩小
     scale_factor: float = 1.0  # 缩放因子
@@ -43,59 +51,124 @@ class DeformationEngine:
         self._foot_locator.SetDataSet(foot_polydata)
         self._foot_locator.BuildLocator()
 
-        # 计算护具内表面法线
-        self._normals = self._compute_normals(brace_polydata, inner_indices)
+        # 缓存内表面顶点坐标和位移方向场
+        self._inner_vertices = self._extract_vertices(brace_polydata, inner_indices)
+        self._directions = self._compute_direction_field(self._inner_vertices)
 
-    @staticmethod
-    def _compute_normals(
-        polydata: vtk.vtkPolyData,
-        indices: np.ndarray,
+        # 预计算内表面顶点法线（用于 directional 模式）
+        self._normals = self._compute_surface_normals()
+
+        # 构建内表面顶点 locator 用于找最近点
+        self._inner_locator = self._build_locator(self._inner_vertices)
+
+        # 缓存所有护具顶点（用于外壳联动）
+        self._all_vertices = self._extract_vertices(brace_polydata, np.arange(brace_polydata.GetNumberOfPoints()))
+        self._inner_set = set(int(idx) for idx in inner_indices)
+
+    def _extract_vertices(
+        self, polydata: vtk.vtkPolyData, indices: np.ndarray
     ) -> np.ndarray:
-        """计算指定顶点的法线向量
-
-        使用网格质心校正法线方向，确保内表面法线一致朝向足部（向内）。
-        """
+        """提取 polydata 中指定索引的顶点坐标"""
         pts = polydata.GetPoints()
         n = len(indices)
-
-        # 使用 vtkPolyDataNormals 计算原始法线
-        norm_filter = vtk.vtkPolyDataNormals()
-        norm_filter.SetInputData(polydata)
-        norm_filter.ComputePointNormalsOn()
-        norm_filter.ComputeCellNormalsOff()
-        norm_filter.ConsistencyOn()
-        norm_filter.SplittingOff()
-        norm_filter.Update()
-
-        vtk_normals = norm_filter.GetOutput().GetPointData().GetNormals()
-
-        # 用质心校正法线方向：内表面法线应朝向质心（向内）
-        centroid = np.zeros(3, dtype=np.float64)
+        vertices = np.zeros((n, 3), dtype=np.float64)
         for i in range(n):
-            idx = int(indices[i])
-            centroid += np.array(pts.GetPoint(idx))
-        centroid /= n
+            vertices[i] = pts.GetPoint(int(indices[i]))
+        return vertices
 
-        normals = np.zeros((n, 3), dtype=np.float64)
-        for i, idx in enumerate(indices):
-            idx = int(idx)
-            if vtk_normals:
-                raw_normal = np.array(vtk_normals.GetTuple(idx))
-            else:
-                raw_normal = np.array(pts.GetPoint(idx)) - centroid
+    def _compute_direction_field(
+        self, vertices: np.ndarray
+    ) -> np.ndarray:
+        """
+        计算统一位移方向场
 
-            # 校正法线方向：确保朝向质心（向内）
-            to_centroid = centroid - np.array(pts.GetPoint(idx))
-            if np.dot(raw_normal, to_centroid) < 0:
-                raw_normal = -raw_normal  # 翻转，使法线朝向质心
+        物理类比：内表面是一个弹性曲面（类似气球表面）。
+        "向外膨胀" = 每个顶点沿从曲面质心指向自己的方向移动
+        "向内收缩" = 反向
 
-            normals[i] = raw_normal
+        这样保证：
+        1. 所有顶点的位移方向统一且连续
+        2. 曲面变形后整体鼓起/收缩，不会出现边缘折痕
+        3. 对于护具这种近似圆柱/球面的形状，径向方向 ≈ 表面法线
+           但方向场的一致性远优于逐顶点法线
+        """
+        centroid = np.mean(vertices, axis=0)
+        directions = vertices - centroid  # 从质心指向各顶点
 
         # 归一化
-        norms = np.linalg.norm(normals, axis=1, keepdims=True)
+        norms = np.linalg.norm(directions, axis=1, keepdims=True)
         norms[norms < 1e-10] = 1.0
-        normals /= norms
-        return normals
+        directions /= norms
+
+        return directions
+
+    def _compute_surface_normals(self) -> np.ndarray:
+        """
+        预计算内表面各顶点的表面法线
+
+        使用 vtkPolyDataNormals 计算网格法线，然后在 _inner_vertices 中查找对应法线。
+        """
+        from vtk.util.numpy_support import vtk_to_numpy
+
+        # 提取内表面的 polydata 以便计算法线
+        inner_poly = vtk.vtkPolyData()
+        pts = vtk.vtkPoints()
+        for v in self._inner_vertices:
+            pts.InsertNextPoint(v[0], v[1], v[2])
+        inner_poly.SetPoints(pts)
+
+        # 复制内表面的 cell 结构
+        cell_array = self.brace_polydata.GetPolys()
+        cell_array.InitTraversal()
+        id_list = vtk.vtkIdList()
+        idx_set = set(int(idx) for idx in self.inner_indices)
+        idx_to_inner = {int(idx): i for i, idx in enumerate(self.inner_indices)}
+
+        new_cells = vtk.vtkCellArray()
+        while cell_array.GetNextCell(id_list):
+            cell_ids = []
+            for k in range(id_list.GetNumberOfIds()):
+                cid = id_list.GetId(k)
+                if cid in idx_set:
+                    cell_ids.append(idx_to_inner[cid])
+            if len(cell_ids) >= 3:
+                new_cells.InsertNextCell(len(cell_ids), cell_ids)
+        inner_poly.SetPolys(new_cells)
+
+        # 计算法线
+        normals_filter = vtk.vtkPolyDataNormals()
+        normals_filter.SetInputData(inner_poly)
+        normals_filter.ComputePointNormalsOn()
+        normals_filter.ComputeCellNormalsOff()
+        normals_filter.AutoOrientNormalsOn()
+        normals_filter.Update()
+
+        normals_data = normals_filter.GetOutput().GetPointData().GetNormals()
+        if normals_data:
+            return vtk_to_numpy(normals_data)
+        return np.zeros_like(self._inner_vertices)
+
+    @staticmethod
+    def _build_locator(vertices: np.ndarray) -> vtk.vtkPointLocator:
+        """
+        对顶点集构建 PointLocator，用于快速查找最近顶点
+        """
+        pts = vtk.vtkPoints()
+        for v in vertices:
+            pts.InsertNextPoint(v[0], v[1], v[2])
+        poly = vtk.vtkPolyData()
+        poly.SetPoints(pts)
+
+        locator = vtk.vtkPointLocator()
+        locator.SetDataSet(poly)
+        locator.BuildLocator()
+        return locator
+
+    def _find_nearest_inner_vertex(self, point: np.ndarray) -> int:
+        """
+        在 _inner_vertices 中找到距离 point 最近的顶点索引（数组索引，0..N-1）
+        """
+        return int(self._inner_locator.FindClosestPoint(point))
 
     def _compute_weights(
         self,
@@ -116,87 +189,111 @@ class DeformationEngine:
         weights = np.maximum(0.0, 1.0 - ratio) ** 2
         return weights
 
-    def _compute_region_weights(
+    def apply_normal(
         self,
-        n_total: int,
-        region_indices: np.ndarray,
-        boundary_smooth: float,
+        vertices: np.ndarray,
+        params: DeformationParams,
     ) -> np.ndarray:
         """
-        计算基于网格的边界平滑权重
+        法向模式：使用统一方向场变形
 
-        1. 区域内顶点权重=1
-        2. 区域外顶点在 smooth 半径内平滑衰减到 0（基于欧氏距离近似）
+        位移方向 = 从曲面质心指向各顶点的径向方向（已在 __init__ 中预计算）
+        位移大小 = offset_mm × 权重（区域权重 × 衰减权重）
+        边界平滑：对权重标量场做拉普拉斯平滑
+
+        这样整个选区像一个鼓起的气球一样整体膨胀/收缩，
+        不会出现边缘折痕或方向不一致的问题。
         """
-        if boundary_smooth <= 0:
-            weights = np.zeros(n_total, dtype=np.float64)
-            weights[region_indices] = 1.0
-            return weights
+        n = len(vertices)
+        result = vertices.copy()
+        region_set = set(params.region_indices.tolist())
 
-        weights = np.zeros(n_total, dtype=np.float64)
-        weights[region_indices] = 1.0
+        # 计算区域权重（硬边界）
+        region_weights = np.zeros(n, dtype=np.float64)
+        region_weights[params.region_indices] = 1.0
 
-        # 获取所有内表面顶点和区域顶点坐标
-        all_verts = np.array([
-            self.brace_polydata.GetPoints().GetPoint(int(i))
-            for i in self.inner_indices
-        ])
-        region_verts = all_verts[region_indices]
+        # 衰减权重
+        center = params.center_point if params.center_point is not None else np.mean(self._inner_vertices, axis=0)
+        if params.decay_radius > 0:
+            decay_weights = self._compute_weights(self._inner_vertices, center, params.decay_radius)
+        else:
+            decay_weights = np.ones(n, dtype=np.float64)
 
-        # 找非区域顶点
-        region_set = set(region_indices.tolist())
-        non_region = [i for i in range(n_total) if i not in region_set]
+        # 组合权重
+        final_weights = region_weights * decay_weights
 
-        if non_region:
-            non_region_arr = np.array(non_region)
-            non_region_verts = all_verts[non_region_arr]
-
-            # 批量计算每个非区域顶点到区域顶点的最小距离
-            # 使用逐块计算避免大矩阵
-            block_size = 2000
-            for start in range(0, len(non_region_arr), block_size):
-                end = min(start + block_size, len(non_region_arr))
-                batch = non_region_verts[start:end]
-
-                # 计算 batch 中每个点到 region_verts 的最小距离
-                # 如果 region 太大也用分块
-                min_dists = np.full(len(batch), np.inf)
-                r_block = 5000
-                for r_start in range(0, len(region_verts), r_block):
-                    r_end = min(r_start + r_block, len(region_verts))
-                    r_batch = region_verts[r_start:r_end]
-                    # (batch, 1, 3) - (1, r_batch, 3) -> (batch, r_batch)
-                    diffs = batch[:, np.newaxis, :] - r_batch[np.newaxis, :, :]
-                    dists = np.linalg.norm(diffs, axis=2)
-                    batch_min = np.min(dists, axis=1)
-                    min_dists = np.minimum(min_dists, batch_min)
-
-                # 应用二次衰减
-                for k, d in enumerate(min_dists):
-                    if d < boundary_smooth:
-                        idx = non_region_arr[start + k]
-                        weights[idx] = (1.0 - d / boundary_smooth) ** 2
-
-        return weights
-
-    def _find_closest_foot_points(
-        self, brace_vertices: np.ndarray
-    ) -> np.ndarray:
-        """查找每个护具顶点在足部表面上的最近点"""
-        n = len(brace_vertices)
-        foot_points = np.zeros((n, 3), dtype=np.float64)
-        closest_point = np.zeros(3, dtype=np.float64)
-        cell_id = vtk.mutable(0)
-        sub_id = vtk.mutable(0)
-        dist2 = vtk.mutable(0.0)
-
-        for i in range(n):
-            self._foot_locator.FindClosestPoint(
-                brace_vertices[i], closest_point, cell_id, sub_id, dist2
+        # 边界平滑：对权重标量场做拉普拉斯平滑
+        if params.boundary_smooth > 0:
+            final_weights = self._smooth_weights(
+                final_weights, params.region_indices, params.boundary_smooth
             )
-            foot_points[i] = closest_point.copy()
 
-        return foot_points
+        # 应用变形
+        displacements = np.zeros_like(vertices)
+        active = final_weights > 0
+        for i in np.where(active)[0]:
+            displacements[i] = params.offset_mm * self._directions[i] * final_weights[i]
+
+        return result + displacements
+
+    def _smooth_weights(
+        self,
+        weights: np.ndarray,
+        region_indices: np.ndarray,
+        smooth_radius: float,
+    ) -> np.ndarray:
+        """
+        对权重标量场做拉普拉斯平滑
+
+        1. 区域顶点权重始终保持 >= 1.0
+        2. 非区域顶点从邻居传播获得权重
+        3. 多次迭代产生平滑过渡带
+        """
+        n = len(weights)
+        result = weights.copy()
+
+        # 构建内表面邻接关系
+        cell_array = self.brace_polydata.GetPolys()
+        cell_array.InitTraversal()
+        id_list = vtk.vtkIdList()
+        idx_to_array = {int(idx): i for i, idx in enumerate(self.inner_indices)}
+
+        adjacency = {i: [] for i in range(n)}
+        while cell_array.GetNextCell(id_list):
+            cell_ids = [id_list.GetId(i) for i in range(id_list.GetNumberOfIds())]
+            array_ids = []
+            for cid in cell_ids:
+                if cid in idx_to_array:
+                    array_ids.append(idx_to_array[cid])
+            for i, aid in enumerate(array_ids):
+                for j, other in enumerate(array_ids):
+                    if i != j and other not in adjacency[aid]:
+                        adjacency[aid].append(other)
+
+        is_in_region = np.zeros(n, dtype=bool)
+        is_in_region[region_indices] = True
+
+        iterations = max(1, min(15, int(smooth_radius / 1.5)))
+
+        for _ in range(iterations):
+            new_weights = result.copy()
+            for i in range(n):
+                if is_in_region[i]:
+                    continue  # 区域顶点权重不变
+                if not adjacency[i]:
+                    continue
+
+                neighbor_sum = 0.0
+                count = 0
+                for j in adjacency[i]:
+                    if result[j] > 0:
+                        neighbor_sum += result[j]
+                        count += 1
+                if count > 0:
+                    new_weights[i] = neighbor_sum / count
+            result = new_weights
+
+        return result
 
     def apply_adaptive(
         self,
@@ -206,19 +303,6 @@ class DeformationEngine:
     ) -> np.ndarray:
         """
         自适应模式：自动调整护具尺寸使平均间隙接近 target_gap
-
-        原理：
-        1. 计算当前平均间隙
-        2. 沿内表面法线方向均匀偏移所有顶点
-        3. 偏移量 = target_gap - current_mean_gap
-
-        参数:
-            vertices: 护具内表面顶点 (N, 3)
-            target_gap: 目标间隙 (mm)
-            current_gaps: 当前逐顶点间隙 (N,)，None 时自动计算
-
-        返回:
-            变形后的顶点数组 (N, 3)
         """
         if current_gaps is None:
             foot_points = self._find_closest_foot_points(vertices)
@@ -243,35 +327,23 @@ class DeformationEngine:
     ) -> np.ndarray:
         """
         径向模式：沿中轴线径向缩放
-
-        原理：
-        1. 拟合中轴线（PCA 主轴）
-        2. 对选区内顶点：沿垂直于轴线的方向缩放
-        3. 带衰减：远离变形中心的点受影响递减
         """
         result = vertices.copy()
 
         # 拟合中轴线
         axis_origin, axis_direction = self._fit_mid_axis(vertices)
 
-        if params.center_point is None:
-            center = np.mean(vertices, axis=0)
-        else:
-            center = params.center_point
-
-        # 选区顶点
+        center = params.center_point if params.center_point is not None else np.mean(vertices, axis=0)
         indices = params.region_indices
         selected = vertices[indices]
 
-        # 计算每个选区顶点到轴线的投影
+        # 计算径向向量
         v = selected - axis_origin
         proj = np.dot(v, axis_direction)[:, np.newaxis] * axis_direction
-        radial_vec = selected - axis_origin - proj  # 径向向量
+        radial_vec = selected - axis_origin - proj
 
-        # 计算权重（衰减）
-        weights = self._compute_weights(
-            selected, center, params.decay_radius
-        )
+        # 衰减权重
+        weights = self._compute_weights(selected, center, params.decay_radius)
 
         # 应用径向缩放
         scale_delta = params.scale_factor - 1.0
@@ -281,43 +353,65 @@ class DeformationEngine:
 
         return result
 
-    def apply_normal(
+    def compute_directional_field(
         self,
-        vertices: np.ndarray,
         params: DeformationParams,
-    ) -> np.ndarray:
+    ) -> tuple:
         """
-        法向模式：沿顶点法线方向偏移
+        计算方向变形的完整位移场（用于外壳联动）
 
-        v' = v + offset * normal(v) * weight(distance)
+        返回: (center, direction, weights) — 可用于对任意顶点集计算位移
         """
-        result = vertices.copy()
+        inner_to_all = {int(idx): i for i, idx in enumerate(self.inner_indices)}
 
-        # 计算区域权重（含边界平滑）
-        region_weights = self._compute_region_weights(
-            len(vertices), params.region_indices, params.boundary_smooth
-        )
-
-        if params.center_point is None:
-            center = np.mean(vertices, axis=0)
-        else:
+        # 确定变形中心点
+        if params.center_point is not None:
             center = params.center_point
-
-        # 计算中心衰减权重
-        if params.decay_radius > 0:
-            center_weights = self._compute_weights(vertices, center, params.decay_radius)
         else:
-            center_weights = np.ones(len(vertices), dtype=np.float64)
+            foot_points = self._find_closest_foot_points(
+                self._inner_vertices[params.region_indices]
+            )
+            gaps = np.linalg.norm(
+                self._inner_vertices[params.region_indices] - foot_points, axis=1
+            )
+            region_closest_idx = int(np.argmin(gaps))
+            closest_idx = int(params.region_indices[region_closest_idx])
+            center = self._inner_vertices[closest_idx]
 
-        # 组合权重 = 区域权重 * 中心衰减
-        final_weights = region_weights * center_weights
+        # 确定位移方向
+        if params.direction is not None:
+            norm = np.linalg.norm(params.direction)
+            direction = params.direction / norm if norm > 1e-10 else np.array([0.0, 0.0, 1.0])
+        else:
+            nearest_idx = self._find_nearest_inner_vertex(center)
+            direction = self._normals[nearest_idx]
+            # 确保方向远离足部（向外 = 扩大空腔）
+            foot_pt = self._find_closest_foot_points(
+                self._inner_vertices[nearest_idx:nearest_idx+1]
+            )[0]
+            to_foot = foot_pt - self._inner_vertices[nearest_idx]
+            if np.dot(direction, to_foot) > 0:
+                direction = -direction
+            direction_norm = np.linalg.norm(direction)
+            if direction_norm > 1e-10:
+                direction = direction / direction_norm
 
-        # 只对有权重的顶点进行变形
-        active = final_weights > 0
-        for i in np.where(active)[0]:
-            result[i] += params.offset_mm * self._normals[i] * final_weights[i]
+        # ---- 动态衰减半径 ----
+        # 如果用户指定的半径太小（小于模型尺寸的80%），自动放大
+        inner_extent = np.ptp(self._inner_vertices, axis=0).max()
+        if params.decay_radius > 0:
+            effective_radius = max(params.decay_radius, inner_extent * 0.8)
+        else:
+            effective_radius = inner_extent * 1.2
 
-        return result
+        # ---- 所有顶点统一权重 ----
+        # 护具是一个整体，变形影响所有在衰减半径内的顶点。
+        # 权重仅由顶点到选点的距离决定。
+        distances = np.linalg.norm(self._all_vertices - center, axis=1)
+        ratio = distances / effective_radius
+        final_weights = np.maximum(0.0, np.cos(np.pi * np.minimum(ratio, 1.0) / 2.0)) ** 2
+
+        return center, direction, final_weights
 
     def apply_directional(
         self,
@@ -325,36 +419,32 @@ class DeformationEngine:
         params: DeformationParams,
     ) -> np.ndarray:
         """
-        方向拉伸：选区顶点沿指定方向拉伸
+        点驱动变形（手指按弹性塑料板）
 
-        v' = v + offset * direction * weight(distance)
+        内侧面顶点：按距离衰减权重变形
+        外侧面顶点：继承最近内侧面顶点的变形量（厚度均匀联动）
         """
+        center, direction, weights = self.compute_directional_field(params)
+
+        # ---- 内表面变形 ----
         result = vertices.copy()
-        indices = params.region_indices
-        selected = vertices[indices]
+        inner_idx_map = {int(idx): i for i, idx in enumerate(self.inner_indices)}
+        inner_disp = {}  # inner_mesh_idx -> displacement vector
 
-        direction = params.direction
-        if direction is None:
-            direction = np.array([0.0, 0.0, 1.0])
-        else:
-            norm = np.linalg.norm(direction)
-            if norm > 1e-10:
-                direction = direction / norm
+        for inner_array_idx in range(len(self._inner_vertices)):
+            mesh_idx = int(self.inner_indices[inner_array_idx])
+            d = params.offset_mm * direction * weights[mesh_idx]
+            result[mesh_idx] += d
+            inner_disp[inner_array_idx] = d
 
-        if params.center_point is None:
-            center = np.mean(selected, axis=0)
-        else:
-            center = params.center_point
-
-        weights = self._compute_weights(
-            selected, center, params.decay_radius
-        )
-
-        for i in range(len(indices)):
-            w = weights[i]
-            result[indices[i]] += (
-                params.offset_mm * direction * w
-            )
+        # ---- 外壳联动：每个外表面顶点继承最近内表面顶点的变形 ----
+        outer_indices = [i for i in range(len(vertices)) if i not in inner_idx_map]
+        if outer_indices:
+            # 对每个外表面顶点，找到最近的内表面顶点
+            for outer_idx in outer_indices:
+                nearest_array_idx = self._find_nearest_inner_vertex(vertices[outer_idx])
+                if nearest_array_idx in inner_disp:
+                    result[outer_idx] += inner_disp[nearest_array_idx]
 
         return result
 
@@ -363,16 +453,7 @@ class DeformationEngine:
         vertices: np.ndarray,
         params: DeformationParams,
     ) -> np.ndarray:
-        """
-        统一入口：根据模式调用对应的变形方法
-
-        参数:
-            vertices: 全部护具内表面顶点 (N, 3)
-            params: 变形参数
-
-        返回:
-            变形后的顶点数组 (N, 3)
-        """
+        """统一入口：根据模式调用对应的变形方法"""
         if params.mode == "adaptive":
             return self.apply_adaptive(vertices)
         elif params.mode == "radial":
@@ -384,23 +465,36 @@ class DeformationEngine:
         else:
             raise ValueError(f"未知变形模式: {params.mode}")
 
+    def _find_closest_foot_points(
+        self, brace_vertices: np.ndarray
+    ) -> np.ndarray:
+        """查找每个护具顶点在足部表面上的最近点"""
+        n = len(brace_vertices)
+        foot_points = np.zeros((n, 3), dtype=np.float64)
+        closest_point = np.zeros(3, dtype=np.float64)
+        cell_id = vtk.mutable(0)
+        sub_id = vtk.mutable(0)
+        dist2 = vtk.mutable(0.0)
+
+        for i in range(n):
+            self._foot_locator.FindClosestPoint(
+                brace_vertices[i], closest_point, cell_id, sub_id, dist2
+            )
+            foot_points[i] = closest_point.copy()
+
+        return foot_points
+
     @staticmethod
     def _fit_mid_axis(
         vertices: np.ndarray,
     ) -> tuple:
-        """
-        使用 PCA 拟合顶点集的中轴线
-
-        返回:
-            (origin, direction) — 轴线上一点和单位方向向量
-        """
+        """使用 PCA 拟合顶点集的中轴线"""
         centroid = np.mean(vertices, axis=0)
         centered = vertices - centroid
         cov = np.cov(centered.T)
         eigenvalues, eigenvectors = np.linalg.eigh(cov)
         main_axis = eigenvectors[:, np.argmax(eigenvalues)]
 
-        # 确保主轴朝 Z 正方向
         if main_axis[2] < 0:
             main_axis = -main_axis
 

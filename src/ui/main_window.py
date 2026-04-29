@@ -275,8 +275,13 @@ class MainWindow(QMainWindow):
         # 尺寸修改
         self.deformation_state = DeformationState()
         self.deformation_engine: Optional[DeformationEngine] = None
-        self._deform_direction = "shrink"  # "shrink" or "expand"
-        self._original_inner_vertices: Optional[np.ndarray] = None  # 原始内表面顶点位置
+        self._deform_mode = "normal"  # "normal", "directional", "radial", "adaptive"
+
+        # 变形选点状态
+        self._deform_point_idx: int = -1  # 当前选点在内表面数组中的索引（-1=未设置）
+        self._inner_adjacency: dict = {}  # 内表面网格邻接表 {idx: [neighbor_indices]}
+        self._base_inner_vertices: Optional[np.ndarray] = None  # 变形引擎初始化时的内表面顶点位置（不变）
+        self._original_inner_vertices: Optional[np.ndarray] = None  # 当前内表面顶点位置（随变形累积）
         self._deformed_inner_vertices: Optional[np.ndarray] = None  # 变形后的内表面顶点位置
         self._preview_vertices: Optional[np.ndarray] = None  # 当前预览的顶点位置
         self._brace_step_filepath: Optional[str] = None  # 护具 STEP 文件路径
@@ -503,47 +508,91 @@ class MainWindow(QMainWindow):
         self.lbl_deform_region.setWordWrap(True)
         deform_layout.addWidget(self.lbl_deform_region)
 
-        # 变形方向和偏移量
-        direction_group = QGroupBox("变形方向")
-        direction_layout = QHBoxLayout()
+        # 变形模式选择
+        mode_group = QGroupBox("变形模式")
+        mode_layout = QVBoxLayout()
 
-        self.btn_shrink = QPushButton("向内收缩")
-        self.btn_shrink.setCheckable(True)
-        self.btn_shrink.setChecked(True)
-        self.btn_shrink.clicked.connect(lambda: self._set_deform_direction("shrink"))
+        self.combo_deform_mode = QComboBox()
+        self.combo_deform_mode.addItems([
+            "法向变形（整体膨胀/收缩）",
+            "方向拉伸（沿指定方向）",
+            "径向缩放（绕中轴线）",
+            "自适应（目标间隙）",
+        ])
+        self.combo_deform_mode.currentIndexChanged.connect(self._on_deform_mode_changed)
+        mode_layout.addWidget(self.combo_deform_mode)
+        mode_group.setLayout(mode_layout)
+        deform_layout.addWidget(mode_group)
 
-        self.btn_expand = QPushButton("向外扩张")
-        self.btn_expand.setCheckable(True)
-        self.btn_expand.clicked.connect(lambda: self._set_deform_direction("expand"))
+        # 方向选择（仅方向拉伸模式可见）
+        self.dir_group = QGroupBox("拉伸方向")
+        dir_layout = QVBoxLayout()
+        dir_layout.addWidget(QLabel("沿选中点的表面法线方向变形"))
+        self._dir_custom = QComboBox()
+        self._dir_custom.addItem("表面法线（默认）")
+        self._dir_custom.addItem("X+ (1, 0, 0)")
+        self._dir_custom.addItem("X- (-1, 0, 0)")
+        self._dir_custom.addItem("Y+ (0, 1, 0)")
+        self._dir_custom.addItem("Y- (0, -1, 0)")
+        self._dir_custom.addItem("Z+ (0, 0, 1)")
+        self._dir_custom.addItem("Z- (0, 0, -1)")
+        dir_layout.addWidget(self._dir_custom)
+        self.dir_group.setLayout(dir_layout)
+        self.dir_group.setVisible(False)
+        deform_layout.addWidget(self.dir_group)
 
-        direction_layout.addWidget(self.btn_shrink)
-        direction_layout.addWidget(self.btn_expand)
-        direction_group.setLayout(direction_layout)
-        deform_layout.addWidget(direction_group)
+        # 变形方向提示（法向模式隐藏方向组后保留此标签）
+        self.lbl_deform_direction = QLabel("方向：用偏移量正负号控制（正=向外扩张，负=向内收缩）")
+        self.lbl_deform_direction.setStyleSheet("color: #888;")
+        deform_layout.addWidget(self.lbl_deform_direction)
 
-        # 偏移量
-        deform_layout.addWidget(QLabel("偏移量 (mm):"))
+        # 变形选点控制（仅方向拉伸模式可见）
+        self.point_group = QGroupBox("变形选点")
+        point_layout = QVBoxLayout()
+        point_layout.addWidget(QLabel("按方向键 ↑↓←→ 移动选点位置"))
+        point_btn_row = QHBoxLayout()
+        self.btn_auto_select_point = QPushButton("自动选距足部最近点")
+        self.btn_auto_select_point.clicked.connect(self._select_closest_to_foot)
+        point_btn_row.addWidget(self.btn_auto_select_point)
+        self.lbl_deform_point = QLabel("未选点")
+        self.lbl_deform_point.setStyleSheet("color: #aaa;")
+        point_btn_row.addWidget(self.lbl_deform_point)
+        point_layout.addLayout(point_btn_row)
+        self.point_group.setLayout(point_layout)
+        self.point_group.setVisible(False)
+        deform_layout.addWidget(self.point_group)
+
+        # 偏移量（正=向外扩张，负=向内收缩）
+        deform_layout.addWidget(QLabel("偏移量 (mm):  正数=向外扩张，负数=向内收缩"))
         self.spin_deform_offset = QDoubleSpinBox()
-        self.spin_deform_offset.setRange(0.1, 20.0)
-        self.spin_deform_offset.setSingleStep(0.5)
-        self.spin_deform_offset.setValue(5.0)
+        self.spin_deform_offset.setRange(-20.0, 20.0)
+        self.spin_deform_offset.setSingleStep(0.1)
+        self.spin_deform_offset.setDecimals(2)
+        self.spin_deform_offset.setValue(0.5)
         deform_layout.addWidget(self.spin_deform_offset)
 
+        # 足部模型可见性控制（用于观察护具内部）
+        foot_vis_group = QGroupBox("足部模型显示")
+        foot_vis_layout = QHBoxLayout()
+        self.btn_foot_visible = QPushButton("隐藏足部")
+        self.btn_foot_visible.setCheckable(True)
+        self.btn_foot_visible.setChecked(True)
+        self.btn_foot_visible.clicked.connect(self._toggle_foot_visibility)
+        self.btn_foot_transparent = QPushButton("半透明")
+        self.btn_foot_transparent.setCheckable(True)
+        self.btn_foot_transparent.clicked.connect(self._set_foot_transparent)
+        foot_vis_layout.addWidget(self.btn_foot_visible)
+        foot_vis_layout.addWidget(self.btn_foot_transparent)
+        foot_vis_group.setLayout(foot_vis_layout)
+        deform_layout.addWidget(foot_vis_group)
+
         # 衰减半径
-        deform_layout.addWidget(QLabel("衰减半径 (mm, 0=无衰减):"))
+        deform_layout.addWidget(QLabel("衰减半径 (mm, 0=整个选区均匀变形):"))
         self.spin_deform_decay = QDoubleSpinBox()
         self.spin_deform_decay.setRange(0.0, 100.0)
         self.spin_deform_decay.setSingleStep(1.0)
         self.spin_deform_decay.setValue(0.0)
         deform_layout.addWidget(self.spin_deform_decay)
-
-        # 边界平滑半径
-        self.spin_boundary_smooth = QDoubleSpinBox()
-        self.spin_boundary_smooth.setRange(0.0, 50.0)
-        self.spin_boundary_smooth.setSingleStep(1.0)
-        self.spin_boundary_smooth.setValue(5.0)
-        deform_layout.addWidget(QLabel("边界平滑 (mm, 0=不平滑):"))
-        deform_layout.addWidget(self.spin_boundary_smooth)
 
         # 操作按钮
         deform_btn_row = QHBoxLayout()
@@ -704,7 +753,24 @@ class MainWindow(QMainWindow):
                 key = event.key()
                 modifiers = event.modifiers()
 
-                # ---- 方向键：相机操作 ----
+                # ---- 方向键：变形选点导航 或 相机操作 ----
+                if (self._deform_mode == "directional"
+                        and self._deform_point_idx >= 0):
+                    # 方向拉伸模式下，方向键控制选点移动
+                    if key == Qt.Key_Up:
+                        self._move_deform_point("up")
+                        return True
+                    if key == Qt.Key_Down:
+                        self._move_deform_point("down")
+                        return True
+                    if key == Qt.Key_Left:
+                        self._move_deform_point("left")
+                        return True
+                    if key == Qt.Key_Right:
+                        self._move_deform_point("right")
+                        return True
+
+                # 默认：方向键控制相机
                 if key == Qt.Key_Up:
                     camera = self.scene.renderer.GetActiveCamera()
                     camera.Zoom(1.1)
@@ -886,6 +952,7 @@ class MainWindow(QMainWindow):
             self.deformation_engine = None
             self._deformed_inner_vertices = None
             self._original_inner_vertices = None
+            self._base_inner_vertices = None
 
             self.brace_model = load_stl(stl_path)
             self.lbl_brace.setText(f"护具模型: {self.brace_model.name}")
@@ -1028,6 +1095,9 @@ class MainWindow(QMainWindow):
         self._inner_vertex_indices = extract_inner_vertices(
             self.brace_model.polydata, self._inner_cells
         )
+
+        # 构建内表面网格邻接表（用于变形选点导航）
+        self._build_inner_adjacency()
 
         # 拆分为连通区域
         # 使用较大的角度阈值和最小区域大小，减少区域数量
@@ -1266,11 +1336,48 @@ class MainWindow(QMainWindow):
 
     # ---- 护具尺寸修改 ----
 
-    def _set_deform_direction(self, direction: str):
-        """设置变形方向"""
-        self._deform_direction = direction
-        self.btn_shrink.setChecked(direction == "shrink")
-        self.btn_expand.setChecked(direction == "expand")
+    def _on_deform_mode_changed(self):
+        """切换变形模式时更新 UI 可见控件"""
+        idx = self.combo_deform_mode.currentIndex()
+        modes = ["normal", "directional", "radial", "adaptive"]
+        self._deform_mode = modes[idx]
+
+        # 方向选择组：仅方向拉伸模式可见
+        self.dir_group.setVisible(self._deform_mode == "directional")
+        # 选点控制：仅方向拉伸模式可见
+        self.point_group.setVisible(self._deform_mode == "directional")
+        # 方向提示文本
+        if self._deform_mode == "normal":
+            self.lbl_deform_direction.setText("方向：用偏移量正负号控制（正=向外扩张，负=向内收缩）")
+        elif self._deform_mode == "directional":
+            self.lbl_deform_direction.setText("方向：选择拉伸轴向")
+            # 切换到方向拉伸模式时自动选点
+            self._ensure_deformation_engine()
+            if self._deform_point_idx < 0:
+                self._select_closest_to_foot()
+        elif self._deform_mode == "radial":
+            self.lbl_deform_direction.setText("方向：绕中轴线径向缩放")
+        elif self._deform_mode == "adaptive":
+            self.lbl_deform_direction.setText("方向：自动计算偏移量")
+
+        # 切换到非方向拉伸模式时隐藏选点标记
+        if self._deform_mode != "directional":
+            self.scene.hide_deform_point_marker()
+            self._render()
+
+    def _get_custom_direction(self) -> Optional[np.ndarray]:
+        """获取方向拉伸模式的自定义方向"""
+        idx = self._dir_custom.currentIndex()
+        axes = [
+            None,                       # 表面法线
+            np.array([1.0, 0.0, 0.0]),  # X+
+            np.array([-1.0, 0.0, 0.0]), # X-
+            np.array([0.0, 1.0, 0.0]),  # Y+
+            np.array([0.0, -1.0, 0.0]), # Y-
+            np.array([0.0, 0.0, 1.0]),  # Z+
+            np.array([0.0, 0.0, -1.0]), # Z-
+        ]
+        return axes[idx]
 
     def _load_brace_step(self):
         """从 STEP 文件加载护具"""
@@ -1297,6 +1404,7 @@ class MainWindow(QMainWindow):
         self.deformation_engine = None
         self._deformed_inner_vertices = None
         self._original_inner_vertices = None
+        self._base_inner_vertices = None
 
         self._prepare_and_load(stl_path)
 
@@ -1311,23 +1419,245 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "加载失败", f"无法加载 STEP 文件:\n{error_msg}")
         self.status_bar.showMessage("STEP 加载失败")
 
+    def _build_inner_adjacency(self):
+        """构建内表面网格的邻接表（用于变形选点导航）"""
+        if self._inner_vertex_indices is None:
+            return
+
+        # 构建全局顶点索引 → 内表面数组索引的映射
+        global_to_inner = {int(idx): i for i, idx in enumerate(self._inner_vertex_indices)}
+
+        adjacency = {i: [] for i in range(len(self._inner_vertex_indices))}
+
+        cell_array = self.brace_model.polydata.GetPolys()
+        cell_array.InitTraversal()
+        id_list = vtk.vtkIdList()
+        while cell_array.GetNextCell(id_list):
+            cell_global_ids = [id_list.GetId(i) for i in range(id_list.GetNumberOfIds())]
+            cell_inner_ids = []
+            for gid in cell_global_ids:
+                if gid in global_to_inner:
+                    cell_inner_ids.append(global_to_inner[gid])
+            # 内侧面三角面的顶点两两相邻
+            for i, aid in enumerate(cell_inner_ids):
+                for j, other in enumerate(cell_inner_ids):
+                    if i != j and other not in adjacency[aid]:
+                        adjacency[aid].append(other)
+
+        self._inner_adjacency = adjacency
+
+    def _move_deform_point(self, direction: str):
+        """
+        移动变形选点 — 方向基于屏幕投影（相机视角）
+        """
+        if self._deform_point_idx < 0 or self._deform_point_idx not in self._inner_adjacency:
+            return
+
+        neighbors = self._inner_adjacency[self._deform_point_idx]
+        if not neighbors:
+            return
+
+        # 使用经过 UserTransform 的世界坐标
+        verts = self._base_inner_vertices if self._base_inner_vertices is not None else self._deformed_inner_vertices
+        brace_transform = self.scene._brace_actor.GetUserTransform() if self.scene._brace_actor else None
+        if brace_transform is not None:
+            mtx = brace_transform.GetMatrix()
+            transform_matrix = np.array([
+                [mtx.GetElement(i, j) for j in range(4)] for i in range(4)
+            ], dtype=np.float64)
+            homogeneous = np.hstack([verts, np.ones((len(verts), 1))])
+            world_verts = (homogeneous @ transform_matrix.T)[:, :3]
+        else:
+            world_verts = verts.copy()
+
+        # 从相机参数计算屏幕空间投影矩阵
+        camera = self.scene.renderer.GetActiveCamera()
+        pos = np.array(camera.GetPosition())
+        fp = np.array(camera.GetFocalPoint())
+        view_up = np.array(camera.GetViewUp())
+
+        # 相机坐标轴
+        cam_z = (pos - fp)
+        cam_z = cam_z / np.linalg.norm(cam_z)  # view direction
+        cam_x = np.cross(view_up, cam_z)
+        cam_x = cam_x / np.linalg.norm(cam_x)  # screen right
+        cam_y = np.cross(cam_z, cam_x)         # screen up
+
+        current_world = world_verts[self._deform_point_idx]
+        delta = world_verts[neighbors] - current_world  # (N, 3)
+
+        # 投影到屏幕轴
+        screen_x = delta @ cam_x  # 屏幕右方向分量
+        screen_y = delta @ cam_y  # 屏幕上方向分量
+
+        screen_dir = {
+            "up":    screen_y,
+            "down":  -screen_y,
+            "left":  -screen_x,
+            "right": screen_x,
+        }
+        scores = screen_dir.get(direction, np.zeros_like(screen_x))
+        best_idx = int(np.argmax(scores))
+        target = neighbors[best_idx]
+
+        self._deform_point_idx = target
+        self._update_deform_point_marker()
+
+        pos = world_verts[self._deform_point_idx]
+        self.lbl_deform_point.setText(
+            f"idx={self._deform_point_idx} ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})"
+        )
+        self.lbl_deform_point.setStyleSheet("color: #4a4;")
+        self.status_bar.showMessage(
+            f"选点移动到: idx={self._deform_point_idx}, "
+            f"位置=({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})"
+        )
+
+    def _update_deform_point_marker(self):
+        """更新/显示变形选点高亮标记
+
+        从 brace actor 的 mapper input（即 apply_distance_colors 创建的
+        DeepCopy）中读取位置，确保黄球与屏幕上显示的护具完全对齐。
+        """
+        if self._deform_point_idx < 0:
+            self.scene.hide_deform_point_marker()
+            return
+
+        if self.brace_model is None or self.scene._brace_actor is None:
+            return
+
+        mesh_idx = int(self._inner_vertex_indices[self._deform_point_idx])
+
+        # 从 mapper 的输入 polydata 读取（与屏幕显示一致）
+        mapper = self.scene._brace_actor.GetMapper()
+        mapper_input = mapper.GetInput()
+        if mapper_input is not None:
+            display_pos = np.array(mapper_input.GetPoint(mesh_idx))
+        else:
+            pts = self.brace_model.polydata.GetPoints()
+            display_pos = np.array(pts.GetPoint(mesh_idx))
+
+        brace_transform = self.scene._brace_actor.GetUserTransform()
+        if brace_transform is not None:
+            world_pos = np.array(brace_transform.TransformPoint(display_pos))
+        else:
+            world_pos = display_pos
+
+        self.scene.show_deform_point_marker(world_pos, None)
+        self._render()
+
+    def _set_deform_point(self, idx: int):
+        """设置变形选点（由 UI 触发）"""
+        if idx < 0 or idx >= len(self._inner_vertex_indices):
+            return
+        self._deform_point_idx = idx
+        self._update_deform_point_marker()
+
+    def _select_closest_to_foot(self):
+        """自动选距足部最近的点作为变形中心"""
+        if self.deformation_engine is None or self._inner_vertex_indices is None:
+            return
+
+        # 找到勾选的选区
+        selected_indices = self._get_selected_region_indices()
+        if selected_indices is None or len(selected_indices) == 0:
+            selected_indices = np.arange(len(self._inner_vertex_indices), dtype=np.int64)
+
+        # 使用当前顶点位置（含累积变形）
+        verts = self._deformed_inner_vertices if self._deformed_inner_vertices is not None else self._base_inner_vertices
+        foot_points = self.deformation_engine._find_closest_foot_points(
+            verts[selected_indices]
+        )
+        gaps = np.linalg.norm(
+            verts[selected_indices] - foot_points, axis=1
+        )
+        region_closest = int(np.argmin(gaps))
+        self._deform_point_idx = int(selected_indices[region_closest])
+
+        print(f"自动选点: 内表面 idx={self._deform_point_idx}, 距足部 {gaps[region_closest]:.2f}mm")
+        pos = verts[self._deform_point_idx]
+        self.lbl_deform_point.setText(
+            f"idx={self._deform_point_idx} ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})"
+        )
+        self.lbl_deform_point.setStyleSheet("color: #4a4;")
+        self._update_deform_point_marker()
+
     def _ensure_deformation_engine(self):
         """确保变形引擎已初始化"""
         if (self.deformation_engine is None
                 and self.foot_model is not None
                 and self.brace_model is not None
                 and self._inner_vertex_indices is not None):
+
             self.deformation_engine = DeformationEngine(
                 self.foot_model.polydata,
                 self.brace_model.polydata,
                 self._inner_vertex_indices,
             )
-            # 保存原始顶点位置
+            # 保存基准顶点位置（polydata 局部坐标，烘焙后的世界坐标）
             pts = self.brace_model.polydata.GetPoints()
-            self._original_inner_vertices = np.array([
+            self._base_inner_vertices = np.array([
                 pts.GetPoint(i) for i in self._inner_vertex_indices
             ])
+            # 当前内表面顶点位置（随变形累积）
+            self._original_inner_vertices = self._base_inner_vertices.copy()
             self._deformed_inner_vertices = self._original_inner_vertices.copy()
+            # 更新选点状态标签
+            if self._deform_point_idx >= 0:
+                pos = self._base_inner_vertices[self._deform_point_idx]
+                self.lbl_deform_point.setText(
+                    f"idx={self._deform_point_idx} ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})"
+                )
+
+    def _bake_brace_transform(self):
+        """将护具的 UserTransform 烘焙到 polydata 顶点中
+
+        同时烘焙 mapper 的深拷贝，确保黄球标记读取的坐标与显示位置一致。
+        """
+        if self.scene._brace_actor is None:
+            return
+        brace_transform = self.scene._brace_actor.GetUserTransform()
+        if brace_transform is None:
+            return
+
+        from vtk.util.numpy_support import numpy_to_vtk, vtk_to_numpy
+
+        # 提取变换矩阵
+        mtx = brace_transform.GetMatrix()
+        transform_matrix = np.array([
+            [mtx.GetElement(i, j) for j in range(4)] for i in range(4)
+        ], dtype=np.float64)
+
+        # 烘焙主 polydata
+        pts = self.brace_model.polydata.GetPoints()
+        pts_array = vtk_to_numpy(pts.GetData())
+        n = len(pts_array)
+        homogeneous = np.hstack([pts_array, np.ones((n, 1))])
+        transformed = (homogeneous @ transform_matrix.T)[:, :3]
+
+        new_pts = vtk.vtkPoints()
+        new_pts.SetData(numpy_to_vtk(transformed))
+        self.brace_model.polydata.SetPoints(new_pts)
+        self.brace_model.polydata.Modified()
+
+        # 同时烘焙 mapper 的深拷贝
+        mapper = self.scene._brace_actor.GetMapper()
+        if mapper is not None:
+            mapper_input = mapper.GetInput()
+            if mapper_input is not None and mapper_input != self.brace_model.polydata:
+                mpts = mapper_input.GetPoints()
+                if mpts is not None:
+                    m_array = vtk_to_numpy(mpts.GetData())
+                    m_homogeneous = np.hstack([m_array, np.ones((len(m_array), 1))])
+                    m_transformed = (m_homogeneous @ transform_matrix.T)[:, :3]
+                    m_new_pts = vtk.vtkPoints()
+                    m_new_pts.SetData(numpy_to_vtk(m_transformed))
+                    mapper_input.SetPoints(m_new_pts)
+                    mapper_input.Modified()
+                    mapper.Modified()
+
+        # 清除 UserTransform
+        self.scene._brace_actor.SetUserTransform(None)
 
     def _get_deformation_params(self) -> DeformationParams:
         """从 UI 获取当前变形参数（基于用户勾选的区域）"""
@@ -1341,16 +1671,30 @@ class MainWindow(QMainWindow):
             return None
 
         offset = self.spin_deform_offset.value()
-        if self._deform_direction == "expand":
-            offset = -offset
+
+        center = None
+        direction = None
+
+        if self._deform_mode == "directional":
+            direction = self._get_custom_direction()
+            # 使用当前变形点位置（含累积变形）
+            if self._deform_point_idx >= 0:
+                verts = self._deformed_inner_vertices if self._deformed_inner_vertices is not None else self._base_inner_vertices
+                center = verts[self._deform_point_idx]
+        elif self._deform_mode == "radial":
+            # 径向模式：使用中轴线方向
+            verts = self._deformed_inner_vertices if self._deformed_inner_vertices is not None else self._base_inner_vertices
+            center = np.mean(verts, axis=0)
 
         return DeformationParams(
-            mode="normal",
+            mode=self._deform_mode,
             region_indices=selected_vertex_indices,
             offset_mm=offset,
             scale_factor=1.0 + offset / 100.0,
             decay_radius=self.spin_deform_decay.value(),
-            boundary_smooth=self.spin_boundary_smooth.value(),
+            boundary_smooth=0.0,
+            direction=direction,
+            center_point=center,
         )
 
     def _get_selected_region_indices(self) -> Optional[np.ndarray]:
@@ -1387,11 +1731,13 @@ class MainWindow(QMainWindow):
     def _preview_deformation(self):
         """预览变形效果（不提交到历史）"""
         if self.brace_model is None or self._inner_vertex_indices is None:
+            self.status_bar.showMessage("错误：请先加载护具并在「模型」标签页选取内侧面")
             QMessageBox.warning(self, "警告", "请先加载护具并在「模型」标签页选取内侧面")
             return
 
         self._ensure_deformation_engine()
         if self.deformation_engine is None:
+            self.status_bar.showMessage("错误：变形引擎初始化失败")
             QMessageBox.warning(self, "警告", "变形引擎初始化失败")
             return
 
@@ -1399,17 +1745,43 @@ class MainWindow(QMainWindow):
         if params is None:
             return
 
-        deformed = self.deformation_engine.apply(
-            self._deformed_inner_vertices, params
+        self.status_bar.showMessage(
+            f"正在预览: 偏移={params.offset_mm:+.1f}mm, 区域顶点数 {len(params.region_indices):,} ..."
         )
-        self._preview_vertices = deformed
 
-        self._apply_vertex_update(deformed)
+        # 方向拉伸模式：使用所有护具顶点（支持外壳联动）
+        if params.mode == "directional":
+            all_vertices = self._get_all_brace_vertices()
+            deformed = self.deformation_engine.apply(all_vertices, params)
+            # 调试：区分内/外表面位移
+            inner_idx = self._inner_vertex_indices.astype(int)
+            all_idx = set(inner_idx.tolist())
+            outer_idx = [i for i in range(len(all_vertices)) if i not in all_idx]
+            inner_disp = np.linalg.norm(deformed[inner_idx] - all_vertices[inner_idx], axis=1)
+            if outer_idx:
+                outer_idx = np.array(outer_idx)
+                outer_disp = np.linalg.norm(deformed[outer_idx] - all_vertices[outer_idx], axis=1)
+                print(f"[方向拉伸] 总顶点 {len(all_vertices)}, 内表面 {len(inner_idx)} / 外表面 {len(outer_idx)}")
+                print(f"  内表面: 最大位移 {np.max(inner_disp):.2f}mm, 平均 {np.mean(inner_disp):.2f}mm")
+                print(f"  外表面: 最大位移 {np.max(outer_disp):.2f}mm, 平均 {np.mean(outer_disp):.2f}mm")
+            else:
+                print(f"[方向拉伸] 总顶点 {len(all_vertices)}, 全部为内表面顶点")
+                print(f"  最大位移 {np.max(inner_disp):.2f}mm")
+            self._preview_vertices = deformed
+            # 同步更新 _deformed_inner_vertices，确保标记位置正确
+            self._deformed_inner_vertices = deformed[inner_idx].copy()
+            self._apply_vertex_update_full(deformed)
+        else:
+            deformed = self.deformation_engine.apply(
+                self._deformed_inner_vertices, params
+            )
+            self._preview_vertices = deformed
+            self._apply_vertex_update(deformed)
         self._render()
 
-        direction_label = "向内收缩" if params.offset_mm > 0 else "向外扩张"
+        direction_label = "向外扩张" if params.offset_mm > 0 else "向内收缩"
         self.status_bar.showMessage(
-            f"预览: {direction_label} {abs(params.offset_mm):.1f}mm — "
+            f"预览中: {direction_label} {abs(params.offset_mm):.1f}mm — "
             f"满意后点击「应用」提交，或点击「还原」取消"
         )
 
@@ -1421,7 +1793,12 @@ class MainWindow(QMainWindow):
 
         self._ensure_deformation_engine()
         if self.deformation_engine is None:
+            self.status_bar.showMessage("错误：变形引擎未初始化")
             return
+
+        self.status_bar.showMessage(
+            f"正在变形: 内表面 {len(self._inner_vertex_indices):,} 顶点 ..."
+        )
 
         if self._preview_vertices is not None:
             final = self._preview_vertices
@@ -1430,15 +1807,20 @@ class MainWindow(QMainWindow):
             params = self._get_deformation_params()
             if params is None:
                 return
-            final = self.deformation_engine.apply(
-                self._deformed_inner_vertices, params
-            )
+            if params.mode == "directional":
+                all_vertices = self._get_all_brace_vertices()
+                final = self.deformation_engine.apply(all_vertices, params)
+            else:
+                final = self.deformation_engine.apply(
+                    self._deformed_inner_vertices, params
+                )
 
         step = DeformationStep(
             mode=params.mode,
             offset_mm=params.offset_mm,
             scale_factor=params.scale_factor,
             decay_radius=params.decay_radius,
+            boundary_smooth=params.boundary_smooth,
             direction=(
                 params.direction.tolist() if params.direction is not None else None
             ),
@@ -1448,7 +1830,14 @@ class MainWindow(QMainWindow):
             region_indices=params.region_indices.tolist(),
         )
         self.deformation_state.push(step)
-        self._deformed_inner_vertices = final.copy()
+
+        if params.mode == "directional":
+            self._deformed_inner_vertices = final.copy()[self._inner_vertex_indices.astype(int)]
+            self._apply_vertex_update_full(final)
+        else:
+            self._deformed_inner_vertices = final.copy()
+            self._apply_vertex_update(final)
+
         self._preview_vertices = None
 
         self._render()
@@ -1456,7 +1845,7 @@ class MainWindow(QMainWindow):
         if self.current_distances is not None:
             self._compute_distance()
 
-        direction_label = "向内收缩" if params.offset_mm > 0 else "向外扩张"
+        direction_label = "向外扩张" if params.offset_mm > 0 else "向内收缩"
         n_regions = len(params.region_indices)
         self.status_bar.showMessage(
             f"已应用{direction_label} {abs(params.offset_mm):.1f}mm "
@@ -1493,28 +1882,143 @@ class MainWindow(QMainWindow):
 
     def _replay_deformations(self):
         """从头重新应用所有变形步骤"""
-        if self._original_inner_vertices is None:
+        if self._base_inner_vertices is None:
             return
         if self.deformation_engine is None:
             return
 
-        self._deformed_inner_vertices = self._original_inner_vertices.copy()
-        for params in self.deformation_state.get_params_list():
-            self._deformed_inner_vertices = self.deformation_engine.apply(
-                self._deformed_inner_vertices, params
-            )
-        self._apply_vertex_update(self._deformed_inner_vertices)
+        # 从基准位置开始重新应用
+        self._deformed_inner_vertices = self._base_inner_vertices.copy()
+
+        # 维护一个完整顶点状态用于 replay（避免每次从 polydata 读取错误状态）
+        all_vertices = self._get_all_brace_vertices()
+
+        for step in self.deformation_state.get_params_list():
+            if step.mode == "directional":
+                # 方向拉伸模式需要所有顶点（外壳联动）
+                deformed_all = self.deformation_engine.apply(all_vertices, step)
+                self._deformed_inner_vertices = deformed_all[self._inner_vertex_indices.astype(int)].copy()
+                self._apply_vertex_update_full(deformed_all)
+                all_vertices = deformed_all  # 保持中间状态
+            else:
+                self._deformed_inner_vertices = self.deformation_engine.apply(
+                    self._deformed_inner_vertices, step
+                )
+                self._apply_vertex_update(self._deformed_inner_vertices)
 
     def _apply_vertex_update(self, deformed_vertices: np.ndarray):
         """将变形后的顶点更新到 VTK polydata 并刷新场景"""
         if self.brace_model is None:
             return
 
+        from vtk.util.numpy_support import numpy_to_vtk, vtk_to_numpy
+
+        inner_indices = self._inner_vertex_indices.astype(int)
+
+        # 更新原始 polydata
         pts = self.brace_model.polydata.GetPoints()
-        for i, idx in enumerate(self._inner_vertex_indices):
-            pts.SetPoint(int(idx), deformed_vertices[i].tolist())
+        pts_array = vtk_to_numpy(pts.GetData())
+        pts_array[inner_indices, :] = deformed_vertices
+        pts.GetData().Modified()
         pts.Modified()
         self.brace_model.polydata.Modified()
+
+        # 同步更新 mapper 中的深拷贝
+        if self.scene._brace_actor is not None:
+            mapper = self.scene._brace_actor.GetMapper()
+            if mapper is not None:
+                mapper_input = mapper.GetInput()
+                if mapper_input is not None and mapper_input != self.brace_model.polydata:
+                    # mapper 使用的是深拷贝，需要同步顶点
+                    mpts = mapper_input.GetPoints()
+                    if mpts is not None and mpts.GetNumberOfPoints() == pts.GetNumberOfPoints():
+                        m_array = vtk_to_numpy(mpts.GetData())
+                        m_array[inner_indices, :] = deformed_vertices
+                        mpts.GetData().Modified()
+                        mpts.Modified()
+                        mapper_input.Modified()
+                        mapper.Modified()
+                        self.scene._brace_actor.Modified()
+
+    def _rebuild_brace_mapper(self):
+        """重建护具模型的 mapper，使其指向已变形的原始 polydata
+
+        这会消除深拷贝导致的幽灵轮廓问题。
+        """
+        if self.scene._brace_actor is None:
+            return
+
+        actor = self.scene._brace_actor
+        old_mapper = actor.GetMapper()
+
+        # 保存旧 mapper 的颜色/标量设置
+        scalar_range = None
+        lut = None
+        scalar_mode = None
+        has_scalars = False
+        if old_mapper is not None:
+            scalar_range = old_mapper.GetScalarRange()
+            lut = old_mapper.GetLookupTable()
+            scalar_mode = old_mapper.GetScalarMode()
+            # 检查旧 mapper 是否有标量数据
+            old_input = old_mapper.GetInput()
+            if old_input is not None and old_input.GetPointData() is not None:
+                if old_input.GetPointData().GetScalars() is not None:
+                    has_scalars = True
+
+        # 创建新 mapper，直接指向原始 polydata
+        new_mapper = vtk.vtkPolyDataMapper()
+        new_mapper.SetInputData(self.brace_model.polydata)
+
+        # 恢复颜色设置
+        if has_scalars and scalar_range is not None:
+            new_mapper.SetScalarModeToUsePointData()
+            new_mapper.SetScalarRange(scalar_range[0], scalar_range[1])
+            if lut is not None:
+                new_mapper.SetLookupTable(lut)
+        else:
+            # 无颜色数据，恢复原色
+            from src.config import BRACE_COLOR, MODEL_OPACITY_NORMAL
+            actor.GetProperty().SetColor(*BRACE_COLOR)
+            actor.GetProperty().SetOpacity(MODEL_OPACITY_NORMAL)
+
+        actor.SetMapper(new_mapper)
+
+    def _get_all_brace_vertices(self) -> np.ndarray:
+        """获取护具所有顶点坐标（用于方向拉伸模式的外壳联动）"""
+        from vtk.util.numpy_support import vtk_to_numpy
+        return vtk_to_numpy(self.brace_model.polydata.GetPoints().GetData())
+
+    def _apply_vertex_update_full(self, all_deformed_vertices: np.ndarray):
+        """更新护具所有顶点（方向拉伸模式的外壳联动）"""
+        if self.brace_model is None:
+            return
+
+        from vtk.util.numpy_support import vtk_to_numpy
+
+        # 更新原始 polydata
+        pts = self.brace_model.polydata.GetPoints()
+        pts_array = vtk_to_numpy(pts.GetData())
+        pts_array[:, :] = all_deformed_vertices
+        pts.GetData().Modified()
+        pts.Modified()
+        self.brace_model.polydata.Modified()
+
+        # 同步更新 mapper 中的深拷贝
+        if self.scene._brace_actor is not None:
+            mapper = self.scene._brace_actor.GetMapper()
+            if mapper is not None:
+                mapper_input = mapper.GetInput()
+                if mapper_input is not None and mapper_input != self.brace_model.polydata:
+                    mpts = mapper_input.GetPoints()
+                    if mpts is not None and mpts.GetNumberOfPoints() == pts.GetNumberOfPoints():
+                        m_array = vtk_to_numpy(mpts.GetData())
+                        m_array[:, :] = all_deformed_vertices
+                        mpts.GetData().Modified()
+                        mpts.Modified()
+                        mapper_input.Modified()
+                        mapper.Modified()
+                        self.scene._brace_actor.Modified()
 
     def _export_stl(self):
         """导出当前护具为 STL"""
@@ -1581,6 +2085,7 @@ class MainWindow(QMainWindow):
         self.deformation_state.clear()
         self._deformed_inner_vertices = None
         self._original_inner_vertices = None
+        self._base_inner_vertices = None
 
         # 清除内侧面高亮和状态
         self._refresh_inner_highlight()
@@ -1978,6 +2483,24 @@ class MainWindow(QMainWindow):
 
     def _on_rotate_step_changed(self, value: float):
         self.rotate_step = value
+
+    def _toggle_foot_visibility(self, checked: bool):
+        """切换足部模型显示/隐藏"""
+        if checked:
+            self.btn_foot_visible.setText("隐藏足部")
+            self.scene.set_foot_opacity(1.0)
+        else:
+            self.btn_foot_visible.setText("显示足部")
+            self.scene.set_foot_opacity(0.0)
+        self._render()
+
+    def _set_foot_transparent(self, checked: bool):
+        """切换足部模型半透明/实体"""
+        if checked:
+            self.scene.set_foot_opacity(0.25)
+        else:
+            self.scene.set_foot_opacity(1.0)
+        self._render()
 
     def _toggle_fine_mode(self, checked: bool):
         self.is_fine_mode = checked

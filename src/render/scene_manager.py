@@ -49,8 +49,7 @@ class SceneManager:
         self._help_text: Optional[vtk.vtkTextActor] = None
         self._coord_text: Optional[vtk.vtkTextActor] = None
 
-        # 护具变换管线（使用 vtkTransformFilter 实现变换）
-        self._brace_transform_filter: Optional[vtk.vtkTransformPolyDataFilter] = None
+        # 护具变换（通过 actor.SetUserTransform() 处理）
         self._current_brace_matrix: Optional[np.ndarray] = None  # 当前变换矩阵
         self._inner_surface_actors: list = []  # 内侧面区域 Actor 列表
         self._measure_actors: list = []  # 测量可视化 Actor 组列表
@@ -58,6 +57,8 @@ class SceneManager:
         self._cursor_text: Optional[vtk.vtkTextActor] = None
         self._pick_marker_actor: Optional[vtk.vtkActor] = None
         self._minmax_actors: list = []  # 最短/最长距离标示 Actor 列表
+        self._deform_point_marker: Optional[vtk.vtkActor] = None  # 变形选点高亮
+        self._deform_point_marker_glyph: Optional[vtk.vtkActor] = None  # vtkGlyph3D 变形选点
 
     def add_help_text(self, show: bool = True):
         """添加/隐藏操作说明文字（右下角）"""
@@ -116,21 +117,15 @@ class SceneManager:
         return actor
 
     def add_brace_model(self, polydata: vtk.vtkPolyData) -> vtk.vtkActor:
-        """添加护具模型到场景"""
-        # 使用 TransformFilter 管线实现变换
-        self._brace_transform_filter = vtk.vtkTransformPolyDataFilter()
-        self._brace_transform_filter.SetInputData(polydata)
+        """添加护具模型到场景
 
-        # 设置初始恒等变换
-        identity = vtk.vtkTransform()
-        identity.Identity()
-        self._brace_transform_filter.SetTransform(identity)
+        mapper 直接连接原始 polydata。
+        旋转/平移通过 actor.SetUserTransform() 处理，不修改 polydata。
+        """
         self._current_brace_matrix = np.eye(4, dtype=np.float64)
 
-        self._brace_transform_filter.Update()
-
         mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputConnection(self._brace_transform_filter.GetOutputPort())
+        mapper.SetInputData(polydata)
 
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
@@ -148,26 +143,22 @@ class SceneManager:
         """
         应用4x4变换矩阵到护具模型
 
-        使用 vtkTransformPolyDataFilter 在 C++ 层执行变换，
-        避免在 Python 中逐点循环。
+        使用 actor.SetUserTransform() 在渲染层应用变换，
+        不修改 polydata 数据，变形引擎可以独立操作 polydata 顶点。
         """
-        if self._brace_transform_filter is None:
+        if self._brace_actor is None:
             return
 
-        # 设置变换矩阵
+        transform = vtk.vtkTransform()
         vtk_matrix = vtk.vtkMatrix4x4()
         for i in range(4):
             for j in range(4):
                 vtk_matrix.SetElement(i, j, float(matrix[i, j]))
-
-        transform = vtk.vtkTransform()
         transform.SetMatrix(vtk_matrix)
-        self._brace_transform_filter.SetTransform(transform)
-        # 关键：标记 filter 已修改，触发 VTK 管道更新
-        self._brace_transform_filter.Modified()
-        self._brace_transform_filter.Update()
 
-        # 保存当前矩阵，用于内侧面高亮 Actor 的位置同步
+        self._brace_actor.SetUserTransform(transform)
+
+        # 保存当前矩阵
         self._current_brace_matrix = matrix.copy()
 
         # 同步所有内侧面区域 Actor 的变换矩阵
@@ -225,20 +216,6 @@ class SceneManager:
 
         colored_polydata.GetPointData().SetScalars(color_array)
 
-        # 如果当前有变换，需要将颜色数据也变换到当前位置
-        if self._current_brace_matrix is not None:
-            vtk_matrix = vtk.vtkMatrix4x4()
-            for i in range(4):
-                for j in range(4):
-                    vtk_matrix.SetElement(i, j, float(self._current_brace_matrix[i, j]))
-            transform = vtk.vtkTransform()
-            transform.SetMatrix(vtk_matrix)
-            tf = vtk.vtkTransformPolyDataFilter()
-            tf.SetInputData(colored_polydata)
-            tf.SetTransform(transform)
-            tf.Update()
-            colored_polydata = tf.GetOutput()
-
         # 更新 lookup table 以支持标量条
         d_min = float(np.min(distances))
         d_max = float(np.max(distances))
@@ -291,20 +268,6 @@ class SceneManager:
         # 深拷贝 polydata
         colored_polydata = vtk.vtkPolyData()
         colored_polydata.DeepCopy(brace_polydata)
-
-        # 应用当前变换到几何体（确保颜色跟着走）
-        if self._current_brace_matrix is not None:
-            vtk_matrix = vtk.vtkMatrix4x4()
-            for i in range(4):
-                for j in range(4):
-                    vtk_matrix.SetElement(i, j, float(self._current_brace_matrix[i, j]))
-            transform = vtk.vtkTransform()
-            transform.SetMatrix(vtk_matrix)
-            tf = vtk.vtkTransformPolyDataFilter()
-            tf.SetInputData(colored_polydata)
-            tf.SetTransform(transform)
-            tf.Update()
-            colored_polydata = tf.GetOutput()
 
         n_total = colored_polydata.GetNumberOfPoints()
         color_array = vtk.vtkUnsignedCharArray()
@@ -442,6 +405,13 @@ class SceneManager:
                 actor.GetProperty().SetRepresentationToWireframe()
             else:
                 actor.GetProperty().SetRepresentationToSurface()
+
+    def set_foot_opacity(self, opacity: float):
+        """设置足部模型透明度，用于观察护具内部变形"""
+        if self._foot_actor is None:
+            return
+        self._foot_actor.GetProperty().SetOpacity(opacity)
+        self._foot_actor.GetProperty().SetRepresentationToWireframe() if opacity < 1.0 else self._foot_actor.GetProperty().SetRepresentationToSurface()
 
     # ---- 测量工具 ----
 
@@ -678,6 +648,42 @@ class SceneManager:
         for actor in self._minmax_actors:
             self.renderer.RemoveActor(actor)
         self._minmax_actors.clear()
+
+    # ---- 变形选点标记 ----
+
+    def show_deform_point_marker(self, position: np.ndarray, transform: Optional[vtk.vtkTransform] = None):
+        """在变形选点位置显示黄色高亮球体"""
+        sphere = vtk.vtkSphereSource()
+        sphere.SetRadius(3.5)
+        sphere.SetThetaResolution(24)
+        sphere.SetPhiResolution(24)
+        sphere.SetCenter(position[0], position[1], position[2])
+
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(sphere.GetOutputPort())
+
+        if self._deform_point_marker is None:
+            self._deform_point_marker = vtk.vtkActor()
+            self._deform_point_marker.SetMapper(mapper)
+            self._deform_point_marker.GetProperty().SetColor(1.0, 0.85, 0.0)
+            self.renderer.AddActor(self._deform_point_marker)
+        else:
+            self._deform_point_marker.SetMapper(mapper)
+            self._deform_point_marker.SetVisibility(True)
+
+    def set_deform_point_marker_transform(self, transform: Optional[vtk.vtkTransform]):
+        """专门设置黄球标记的 UserTransform（与护具 actor 同步）"""
+        if self._deform_point_marker is None:
+            return
+        if transform is not None:
+            self._deform_point_marker.SetUserTransform(transform)
+        else:
+            self._deform_point_marker.SetUserTransform(None)
+
+    def hide_deform_point_marker(self):
+        """隐藏变形选点标记"""
+        if self._deform_point_marker is not None:
+            self._deform_point_marker.SetVisibility(False)
 
     # ---- 相机 ----
 

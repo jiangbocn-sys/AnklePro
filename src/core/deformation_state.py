@@ -17,6 +17,7 @@ class DeformationStep:
     offset_mm: float
     scale_factor: float
     decay_radius: float
+    boundary_smooth: float
     direction: Optional[List[float]]
     center_point: Optional[List[float]]
     region_indices: List[int]  # JSON 可序列化的索引列表
@@ -66,6 +67,7 @@ class DeformationState:
                 offset_mm=step.offset_mm,
                 scale_factor=step.scale_factor,
                 decay_radius=step.decay_radius,
+                boundary_smooth=step.boundary_smooth,
                 direction=direction,
                 center_point=center,
             ))
