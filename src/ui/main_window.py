@@ -2119,6 +2119,28 @@ class MainWindow(QMainWindow):
         self.scene.clear_min_max_indicators()
         self.scene.hide_deform_point_marker()
 
+        # 清除坐标轴
+        if self.scene.axes_actor is not None:
+            self.scene.renderer.RemoveActor(self.scene.axes_actor)
+            self.scene.axes_actor = None
+        if hasattr(self.scene, '_axis_line_actors'):
+            for actor in self.scene._axis_line_actors:
+                self.scene.renderer.RemoveActor(actor)
+            self.scene._axis_line_actors = []
+        if hasattr(self.scene, '_label_actors'):
+            for actor in self.scene._label_actors:
+                self.scene.renderer.RemoveActor(actor)
+            self.scene._label_actors = []
+        if hasattr(self.scene, '_tick_actors'):
+            for actor in self.scene._tick_actors:
+                self.scene.renderer.RemoveActor(actor)
+            self.scene._tick_actors = []
+
+        # 清除坐标文字
+        if self.scene._coord_text is not None:
+            self.scene.renderer.RemoveActor(self.scene._coord_text)
+            self.scene._coord_text = None
+
         # 重置所有模型和状态
         self.foot_model = None
         self.brace_model = None
@@ -2126,6 +2148,8 @@ class MainWindow(QMainWindow):
         self.distance_calc = None
         self.radial_calc = None
         self.current_distances = None
+        self._last_calc_position = np.zeros(3)
+        self._pending_recalc = False
         self.deformation_state.clear()
         self.deformation_engine = None
 
@@ -2153,6 +2177,14 @@ class MainWindow(QMainWindow):
         self.lbl_vertices.setText("顶点数: -")
         self.stats_text.clear()
         self.region_list.clear()
+
+        # 重置 UI 坐标显示
+        self.lbl_tx.setText("X = 0.0mm")
+        self.lbl_ty.setText("Y = 0.0mm")
+        self.lbl_tz.setText("Z = 0.0mm")
+        self.lbl_rx.setText("Rx = 0.0°")
+        self.lbl_ry.setText("Ry = 0.0°")
+        self.lbl_rz.setText("Rz = 0.0°")
 
         # 重置相机
         self.scene.reset_camera()
