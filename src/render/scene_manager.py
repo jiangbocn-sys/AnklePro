@@ -388,6 +388,8 @@ class SceneManager:
 
     def clear_inner_surface_actors(self):
         """清除所有内侧面区域 Actor"""
+        for actor in self._inner_surface_actors:
+            self.renderer.RemoveActor(actor)
         self._inner_surface_actors.clear()
 
     def clear_distance_colors(self):
