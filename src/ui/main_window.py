@@ -1189,10 +1189,10 @@ class MainWindow(QMainWindow):
     def _refresh_inner_highlight(self):
         """清除旧的内侧面高亮"""
         for actor in self._region_actor_map.values():
-            self.scene.renderer.RemoveActor(actor)
+            self._safe_remove_actor(actor)
         self._region_actor_map.clear()
         for label in self._region_labels:
-            self.scene.renderer.RemoveActor(label)
+            self._safe_remove_actor(label)
         self._region_labels = []
         self.scene.clear_inner_surface_actors()
 
@@ -2104,43 +2104,40 @@ class MainWindow(QMainWindow):
 
     def _clear_workspace(self):
         """清除所有模型和状态，回到初始状态以便加载新模型"""
-        # 清除内侧面高亮（包含 region actors 和 scene actors）
-        self._refresh_inner_highlight()
+        try:
+            # 清除内侧面高亮（包含 region actors 和 scene actors）
+            self._refresh_inner_highlight()
+        except Exception:
+            pass
 
-        # 从场景中移除模型
-        if self.scene._foot_actor:
-            self.scene.renderer.RemoveActor(self.scene._foot_actor)
-            self.scene._foot_actor = None
-        if self.scene._brace_actor:
-            self.scene.renderer.RemoveActor(self.scene._brace_actor)
-            self.scene._brace_actor = None
+        # 从场景中移除模型（安全包装）
+        self._safe_remove_actor(self.scene._foot_actor)
+        self.scene._foot_actor = None
+        self._safe_remove_actor(self.scene._brace_actor)
+        self.scene._brace_actor = None
 
         # 清除所有可视化元素
-        self.scene.clear_distance_colors()
-        self.scene.clear_min_max_indicators()
-        self.scene.hide_deform_point_marker()
+        try:
+            self.scene.clear_distance_colors()
+            self.scene.clear_min_max_indicators()
+            self.scene.hide_deform_point_marker()
+        except Exception:
+            pass
 
         # 清除坐标轴
-        if self.scene.axes_actor is not None:
-            self.scene.renderer.RemoveActor(self.scene.axes_actor)
-            self.scene.axes_actor = None
-        if hasattr(self.scene, '_axis_line_actors'):
-            for actor in self.scene._axis_line_actors:
-                self.scene.renderer.RemoveActor(actor)
-            self.scene._axis_line_actors = []
-        if hasattr(self.scene, '_label_actors'):
-            for actor in self.scene._label_actors:
-                self.scene.renderer.RemoveActor(actor)
-            self.scene._label_actors = []
-        if hasattr(self.scene, '_tick_actors'):
-            for actor in self.scene._tick_actors:
-                self.scene.renderer.RemoveActor(actor)
-            self.scene._tick_actors = []
+        self._safe_remove_actor(self.scene.axes_actor)
+        self.scene.axes_actor = None
+
+        for attr in ('_axis_line_actors', '_label_actors', '_tick_actors'):
+            if hasattr(self.scene, attr):
+                actors = getattr(self.scene, attr)
+                for actor in (actors or []):
+                    self._safe_remove_actor(actor)
+                setattr(self.scene, attr, [])
 
         # 清除坐标文字
-        if self.scene._coord_text is not None:
-            self.scene.renderer.RemoveActor(self.scene._coord_text)
-            self.scene._coord_text = None
+        self._safe_remove_actor(getattr(self.scene, '_coord_text', None))
+        self.scene._coord_text = None
 
         # 重置所有模型和状态
         self.foot_model = None
@@ -2888,6 +2885,15 @@ class MainWindow(QMainWindow):
         writer.SetInputConnection(w2i.GetOutputPort())
         writer.Write()
         self.status_bar.showMessage(f"截图已保存: {filepath}")
+
+    def _safe_remove_actor(self, actor):
+        """安全地移除 VTK Actor（编译环境下防止 None 或已删除 actor 导致闪退）"""
+        if actor is None:
+            return
+        try:
+            self.scene.renderer.RemoveActor(actor)
+        except Exception:
+            pass
 
     def _render(self):
         """刷新渲染"""
