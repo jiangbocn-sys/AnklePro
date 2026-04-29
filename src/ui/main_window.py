@@ -362,7 +362,13 @@ class MainWindow(QMainWindow):
 
         control_main.addWidget(page_widget, stretch=1)
 
-        panel_layout.addWidget(control_container)
+        # 添加滚动容器到主布局
+        from PyQt5.QtWidgets import QScrollArea
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setWidget(control_container)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        main_layout.addWidget(scroll_area, stretch=1)
 
         # ============ 页面 0: 模型加载 ============
         model_tab = QWidget()
