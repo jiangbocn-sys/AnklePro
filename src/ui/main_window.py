@@ -352,6 +352,9 @@ class MainWindow(QMainWindow):
         btn_radial.clicked.connect(self._compute_radial_distance)
         btn_reset = QPushButton("重置变换")
         btn_reset.clicked.connect(self._reset_transform)
+        btn_clear = QPushButton("清除空间")
+        btn_clear.clicked.connect(self._clear_workspace)
+        btn_clear.setStyleSheet("background-color: #c0392b; color: white; font-weight: bold;")
 
         btn_layout = QVBoxLayout()
         btn_layout.addWidget(btn_load_foot)
@@ -361,6 +364,7 @@ class MainWindow(QMainWindow):
         btn_layout.addWidget(btn_optimize)
         btn_layout.addWidget(btn_radial)
         btn_layout.addWidget(btn_reset)
+        btn_layout.addWidget(btn_clear)
         model_layout.addLayout(btn_layout)
 
         # 内侧面区域列表
@@ -2096,6 +2100,59 @@ class MainWindow(QMainWindow):
         self.region_list.clear()
 
         self._render()
+
+    def _clear_workspace(self):
+        """清除所有模型和状态，回到初始状态以便加载新模型"""
+        # 从场景中移除模型
+        if self.scene._foot_actor:
+            self.scene.renderer.RemoveActor(self.scene._foot_actor)
+            self.scene._foot_actor = None
+        if self.scene._brace_actor:
+            self.scene.renderer.RemoveActor(self.scene._brace_actor)
+            self.scene._brace_actor = None
+
+        # 清除所有可视化元素
+        self.scene.clear_distance_colors()
+        self.scene.clear_min_max_indicators()
+        self.scene.clear_inner_surface_actors()
+        self.scene.hide_deform_point_marker()
+
+        # 重置所有模型和状态
+        self.foot_model = None
+        self.brace_model = None
+        self.brace_transform = TransformManager()
+        self.distance_calc = None
+        self.radial_calc = None
+        self.current_distances = None
+        self.deformation_state.clear()
+        self.deformation_engine = None
+
+        # 清除内侧面状态
+        self._inner_cells = None
+        self._inner_regions = []
+        self._inner_vertex_indices = None
+        self._region_actor_map.clear()
+        self._inner_adjacency = {}
+        self._base_inner_vertices = None
+        self._original_inner_vertices = None
+        self._deformed_inner_vertices = None
+        self._preview_vertices = None
+        self._deform_point_idx = -1
+
+        # 清除 UI 状态
+        self.lbl_foot.setText("足部模型: 未加载")
+        self.lbl_brace.setText("护具模型: 未加载")
+        self.lbl_vertices.setText("顶点数: -")
+        self.stats_text.clear()
+        self.region_list.clear()
+        self._current_brace_filepath = None
+        self._brace_step_filepath = None
+
+        # 重置相机
+        self.scene.reset_camera()
+        self._render()
+
+        self.status_bar.showMessage("工作区已清除，请加载新的足部和护具模型")
 
     def _reset_camera(self):
         """重置相机"""
