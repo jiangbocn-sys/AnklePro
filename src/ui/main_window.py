@@ -23,10 +23,10 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QProgressDialog,
     QPushButton,
+    QStackedWidget,
     QStatusBar,
     QTableWidget,
     QTableWidgetItem,
-    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -308,25 +308,66 @@ class MainWindow(QMainWindow):
         self.vtk_widget = QVTKRenderWindowInteractor(central)
         main_layout.addWidget(self.vtk_widget, stretch=4)
 
-        # --- 右侧: 控制面板 ---
-        panel = QWidget()
-        panel.setFixedWidth(320)
-        panel_layout = QVBoxLayout(panel)
-        panel_layout.setSpacing(6)
-        # 添加滚动区域
-        from PyQt5.QtWidgets import QScrollArea
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setWidget(panel)
-        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        main_layout.addWidget(scroll_area, stretch=1)
+        # --- 右侧控制面板: 侧边导航 + 堆叠面板 ---
+        control_container = QWidget()
+        control_main = QHBoxLayout(control_container)
+        control_main.setContentsMargins(0, 0, 0, 0)
+        control_main.setSpacing(0)
 
-        tab_widget = QTabWidget()
-        self.tab_widget = tab_widget  # 保存引用用于切换标签
+        # 侧边导航栏
+        sidebar = QWidget()
+        sidebar.setFixedWidth(80)
+        sidebar.setStyleSheet("background-color: #2c3e50;")
+        side_layout = QVBoxLayout(sidebar)
+        side_layout.setContentsMargins(0, 0, 0, 0)
+        side_layout.setSpacing(2)
+        side_layout.addSpacing(8)
 
-        # Tab 1: 模型和计算
+        # 导航按钮列表
+        self._nav_buttons: list = []
+        nav_items = [
+            ("模型加载", 0),
+            ("内侧面", 1),
+            ("颜色", 2),
+            ("统计", 3),
+            ("设置", 4),
+            ("尺寸修改", 5),
+        ]
+        for text, idx in nav_items:
+            btn = QPushButton(text)
+            btn.setCheckable(True)
+            btn.setFixedHeight(36)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setStyleSheet(self._nav_button_style(False))
+            btn.clicked.connect(lambda _, i=idx: self._switch_page(i))
+            side_layout.addWidget(btn)
+            self._nav_buttons.append(btn)
+            if text in ("模型加载", "设置"):
+                side_layout.addSpacing(6)
+        side_layout.addStretch()
+
+        self._nav_buttons[0].setChecked(True)
+        self._nav_buttons[0].setStyleSheet(self._nav_button_style(True))
+
+        control_main.addWidget(sidebar)
+
+        # 堆叠面板容器
+        page_widget = QWidget()
+        page_layout = QVBoxLayout(page_widget)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(0)
+
+        self.stack = QStackedWidget()
+        page_layout.addWidget(self.stack)
+
+        control_main.addWidget(page_widget, stretch=1)
+
+        panel_layout.addWidget(control_container)
+
+        # ============ 页面 0: 模型加载 ============
         model_tab = QWidget()
         model_layout = QVBoxLayout(model_tab)
+        model_layout.setContentsMargins(6, 6, 6, 6)
 
         model_group = QGroupBox("模型信息")
         model_group_layout = QVBoxLayout()
@@ -408,22 +449,52 @@ class MainWindow(QMainWindow):
         btn_save.clicked.connect(self._save_position)
         btn_load = QPushButton("加载选中位置")
         btn_load.clicked.connect(self._load_position)
-        btn_clear = QPushButton("清空")
-        btn_clear.clicked.connect(self._clear_position)
+        btn_clear_pos = QPushButton("清空")
+        btn_clear_pos.clicked.connect(self._clear_position)
         save_btn_layout.addWidget(btn_save)
         save_btn_layout.addWidget(btn_load)
-        save_btn_layout.addWidget(btn_clear)
+        save_btn_layout.addWidget(btn_clear_pos)
         save_group_layout.addLayout(save_btn_layout)
 
         save_group.setLayout(save_group_layout)
         model_layout.addWidget(save_group)
 
         model_layout.addStretch()
-        tab_widget.addTab(model_tab, "模型")
+        self.stack.addWidget(model_tab)
 
-        # Tab 2: 颜色阈值
+        # ============ 页面 1: 内侧面 ============
+        inner_page = QWidget()
+        inner_page_layout = QVBoxLayout(inner_page)
+        inner_page_layout.setContentsMargins(6, 6, 6, 6)
+
+        inner_page_group = QGroupBox("内侧面区域")
+        inner_page_group_layout = QVBoxLayout()
+        self.region_list_2 = QListWidget()
+        self.region_list_2.setSelectionMode(QListWidget.NoSelection)
+        self.region_list_2.itemChanged.connect(self._on_region_toggled)
+        self.region_list_2.setMaximumHeight(150)
+        inner_page_group_layout.addWidget(self.region_list_2)
+
+        inner_page_btn_layout = QHBoxLayout()
+        btn_select_all_2 = QPushButton("全选")
+        btn_select_all_2.clicked.connect(self._select_all_regions)
+        btn_deselect_all_2 = QPushButton("全不选")
+        btn_deselect_all_2.clicked.connect(self._deselect_all_regions)
+        inner_page_btn_layout.addWidget(btn_select_all_2)
+        inner_page_btn_layout.addWidget(btn_deselect_all_2)
+        inner_page_group_layout.addLayout(inner_page_btn_layout)
+        inner_page_group.setLayout(inner_page_group_layout)
+        inner_page_layout.addWidget(inner_page_group)
+
+        inner_page_layout.addWidget(QLabel("提示：勾选区域后返回「模型加载」进行距离计算"))
+
+        inner_page_layout.addStretch()
+        self.stack.addWidget(inner_page)
+
+        # ============ 页面 2: 颜色设置 ============
         color_tab = QWidget()
         color_layout = QVBoxLayout(color_tab)
+        color_layout.setContentsMargins(6, 6, 6, 6)
 
         self.preset_combo = QComboBox()
         for name in PRESET_THRESHOLDS:
@@ -440,21 +511,23 @@ class MainWindow(QMainWindow):
         color_layout.addWidget(self.threshold_table)
 
         self._refresh_threshold_table()
-        tab_widget.addTab(color_tab, "颜色")
+        color_layout.addStretch()
+        self.stack.addWidget(color_tab)
 
-        # Tab 3: 统计结果
+        # ============ 页面 3: 统计结果 ============
         stats_tab = QWidget()
         stats_layout = QVBoxLayout(stats_tab)
+        stats_layout.setContentsMargins(6, 6, 6, 6)
         self.stats_text = QTextEdit()
         self.stats_text.setReadOnly(True)
         self.stats_text.setFont(QFont("Menlo", 10))
         stats_layout.addWidget(self.stats_text)
-        tab_widget.addTab(stats_tab, "统计")
-        self.stats_tab_index = 2  # 记录统计标签页索引
+        self.stack.addWidget(stats_tab)
 
-        # Tab 4: 操作设置
+        # ============ 页面 4: 操作设置 ============
         control_tab = QWidget()
         control_layout = QVBoxLayout(control_tab)
+        control_layout.setContentsMargins(6, 6, 6, 6)
 
         control_layout.addWidget(QLabel("移动步长 (mm):"))
         self.spin_move = QDoubleSpinBox()
@@ -487,11 +560,12 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(self.btn_measure)
 
         control_layout.addStretch()
-        tab_widget.addTab(control_tab, "设置")
+        self.stack.addWidget(control_tab)
 
-        # Tab 5: 护具尺寸修改
+        # ============ 页面 5: 尺寸修改 ============
         deform_tab = QWidget()
         deform_layout = QVBoxLayout(deform_tab)
+        deform_layout.setContentsMargins(6, 6, 6, 6)
 
         # STEP 加载/转换区域
         step_load_group = QGroupBox("STEP 加载")
@@ -509,7 +583,7 @@ class MainWindow(QMainWindow):
         deform_layout.addWidget(step_load_group)
 
         # 变形区域选择提示
-        self.lbl_deform_region = QLabel("变形区域：请先在「模型」标签页选取内侧面并勾选区域")
+        self.lbl_deform_region = QLabel("变形区域：请先选取内侧面并勾选区域")
         self.lbl_deform_region.setWordWrap(True)
         deform_layout.addWidget(self.lbl_deform_region)
 
@@ -546,7 +620,7 @@ class MainWindow(QMainWindow):
         self.dir_group.setVisible(False)
         deform_layout.addWidget(self.dir_group)
 
-        # 变形方向提示（法向模式隐藏方向组后保留此标签）
+        # 变形方向提示
         self.lbl_deform_direction = QLabel("方向：用偏移量正负号控制（正=向外扩张，负=向内收缩）")
         self.lbl_deform_direction.setStyleSheet("color: #888;")
         deform_layout.addWidget(self.lbl_deform_direction)
@@ -567,7 +641,7 @@ class MainWindow(QMainWindow):
         self.point_group.setVisible(False)
         deform_layout.addWidget(self.point_group)
 
-        # 偏移量（正=向外扩张，负=向内收缩）
+        # 偏移量
         deform_layout.addWidget(QLabel("偏移量 (mm):  正数=向外扩张，负数=向内收缩"))
         self.spin_deform_offset = QDoubleSpinBox()
         self.spin_deform_offset.setRange(-20.0, 20.0)
@@ -576,7 +650,7 @@ class MainWindow(QMainWindow):
         self.spin_deform_offset.setValue(0.5)
         deform_layout.addWidget(self.spin_deform_offset)
 
-        # 足部模型可见性控制（用于观察护具内部）
+        # 足部模型可见性控制
         foot_vis_group = QGroupBox("足部模型显示")
         foot_vis_layout = QHBoxLayout()
         self.btn_foot_visible = QPushButton("隐藏足部")
@@ -626,9 +700,7 @@ class MainWindow(QMainWindow):
         deform_layout.addLayout(export_btn_row)
 
         deform_layout.addStretch()
-        tab_widget.addTab(deform_tab, "尺寸修改")
-
-        panel_layout.addWidget(tab_widget)
+        self.stack.addWidget(deform_tab)
 
         # 坐标信息
         coord_group = QGroupBox("护具位置")
@@ -949,7 +1021,7 @@ class MainWindow(QMainWindow):
             self._inner_regions = []
             self._inner_vertex_indices = None
             self._region_actor_map.clear()
-            self.region_list.clear()
+            self._clear_region_lists()
 
             # 清除旧的距离标示和变形状态
             self.scene.clear_min_max_indicators()
@@ -1118,7 +1190,7 @@ class MainWindow(QMainWindow):
         self._render()
 
         # 更新区域列表
-        self.region_list.clear()
+        self._clear_region_lists()
         # 使用高饱和度、高对比度的颜色方案，确保各区域清晰可辨
         colors = [
             (255, 50, 50),    # 区域 1: 鲜艳红色
@@ -1138,6 +1210,7 @@ class MainWindow(QMainWindow):
             item.setCheckState(Qt.Unchecked)  # 默认不选
             item.setData(Qt.UserRole, (i, color))
             self.region_list.addItem(item)
+            self.region_list_2.addItem(item.clone())
 
         n_inner = len(self._inner_cells)
         n_vertices = len(self._inner_vertex_indices)
@@ -1150,15 +1223,12 @@ class MainWindow(QMainWindow):
 
     def _on_region_toggled(self, item: QListWidgetItem):
         """区域 checkbox 状态变化 - 增量更新高亮显示"""
-        # 获取当前 item 对应的区域索引
         region_idx, color = item.data(Qt.UserRole)
         region_cells = self._inner_regions[region_idx]
 
-        # 淡蓝色高亮颜色 (100, 180, 255) - 所有勾选的区域都使用统一的淡蓝色
         highlight_color = (100, 180, 255)
 
         if item.checkState() == Qt.Checked:
-            # 勾选：添加该区域的高亮 Actor（使用大红色）
             if region_idx not in self._region_actor_map:
                 actor = self.scene._create_inner_surface_actor(
                     self.brace_model.polydata, region_cells, highlight_color
@@ -1166,25 +1236,30 @@ class MainWindow(QMainWindow):
                 self.scene.renderer.AddActor(actor)
                 self._region_actor_map[region_idx] = actor
         else:
-            # 取消勾选：移除该区域的高亮 Actor
             if region_idx in self._region_actor_map:
                 actor = self._region_actor_map[region_idx]
                 self.scene.renderer.RemoveActor(actor)
                 del self._region_actor_map[region_idx]
 
+        # 同步另一个列表的勾选状态
+        for lst in (self.region_list, self.region_list_2):
+            other_item = lst.item(region_idx)
+            if other_item is not None and other_item is not item:
+                other_item.setCheckState(item.checkState())
+
         self._render()
 
     def _select_all_regions(self):
         """全选所有区域"""
-        for i in range(self.region_list.count()):
-            item = self.region_list.item(i)
-            item.setCheckState(Qt.Checked)
+        for lst in (self.region_list, self.region_list_2):
+            for i in range(lst.count()):
+                lst.item(i).setCheckState(Qt.Checked)
 
     def _deselect_all_regions(self):
         """全不选所有区域"""
-        for i in range(self.region_list.count()):
-            item = self.region_list.item(i)
-            item.setCheckState(Qt.Unchecked)
+        for lst in (self.region_list, self.region_list_2):
+            for i in range(lst.count()):
+                lst.item(i).setCheckState(Qt.Unchecked)
 
     def _refresh_inner_highlight(self):
         """清除旧的内侧面高亮"""
@@ -2398,8 +2473,8 @@ class MainWindow(QMainWindow):
             # 标示最短/最长距离点
             self._draw_min_max_indicators(selected_vertices)
 
-            # 切换到统计标签页
-            self.tab_widget.setCurrentIndex(self.stats_tab_index)
+            # 切换到统计页面
+            self._switch_page(3)
 
             self._render()
 
@@ -2885,6 +2960,32 @@ class MainWindow(QMainWindow):
         writer.SetInputConnection(w2i.GetOutputPort())
         writer.Write()
         self.status_bar.showMessage(f"截图已保存: {filepath}")
+
+    def _switch_page(self, index: int):
+        """切换到指定页面，同时更新导航按钮高亮"""
+        self.stack.setCurrentIndex(index)
+        for i, btn in enumerate(self._nav_buttons):
+            checked = (i == index)
+            btn.setChecked(checked)
+            btn.setStyleSheet(self._nav_button_style(checked))
+
+    def _nav_button_style(self, checked: bool) -> str:
+        """返回导航按钮的样式样式表"""
+        if checked:
+            return (
+                "background-color: #34495e; color: white; "
+                "border: none; border-radius: 4px; font-weight: bold; "
+                "padding-left: 8px;"
+            )
+        return (
+            "background-color: transparent; color: #bdc3c7; "
+            "border: none; border-radius: 4px; padding-left: 8px;"
+        )
+
+    def _clear_region_lists(self):
+        """同时清除两个页面中的内侧面区域列表"""
+        self.region_list.clear()
+        self.region_list_2.clear()
 
     def _safe_remove_actor(self, actor):
         """安全地移除 VTK Actor（编译环境下防止 None 或已删除 actor 导致闪退）"""
