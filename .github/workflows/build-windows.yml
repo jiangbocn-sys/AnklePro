@@ -31,6 +31,11 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller>=6.0
 
+      - name: Read version
+        id: version
+        shell: bash
+        run: echo "VERSION=$(grep '__version__' src/version.py | head -1 | sed 's/.*"\(.*\)"/\1/')" >> $GITHUB_OUTPUT
+
       - name: Build with PyInstaller
         run: |
           pyinstaller --clean anklepro.spec
@@ -43,16 +48,20 @@ jobs:
           }
           Get-Item dist\AnklePro.exe | Select-Object Name, Length
 
+      - name: Rename artifact
+        shell: bash
+        run: cp dist/AnklePro.exe "dist/AnklePro_${{ steps.version.outputs.VERSION }}.exe"
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: AnklePro-Windows
-          path: dist/AnklePro.exe
+          path: dist/AnklePro_*.exe
           if-no-files-found: error
 
       - name: Create Release (on tag)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/AnklePro.exe
+          files: dist/AnklePro_*.exe
           generate_release_notes: true

@@ -41,6 +41,7 @@ from src.config import (
     PRESET_THRESHOLDS,
     DEFAULT_PRESET,
 )
+from src.version import __version__
 from src.core.model_loader import ModelData, load_stl
 from src.core.transform_manager import TransformManager
 from src.core.distance_calculator import DistanceCalculator
@@ -229,7 +230,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AnklePro — 足部护具贴合度分析 v0.1.0")
+        self.setWindowTitle(f"AnklePro — 足部护具贴合度分析 {__version__}")
         # 根据屏幕尺寸调整窗口大小，确保不超出屏幕
         screen = self.screen().geometry()
         window_width = min(1400, int(screen.width() * 0.9))
