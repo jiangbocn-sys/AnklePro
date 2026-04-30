@@ -7,6 +7,7 @@ from typing import Optional
 import numpy as np
 import vtk
 from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QAction,
     QComboBox,
@@ -305,15 +306,19 @@ class ActionsMixin:
             item.setCheckState(Qt.Unchecked)  # 默认不选
             item.setData(Qt.UserRole, (i, color))
             self.region_list.addItem(item)
-            self.region_list_2.addItem(item.clone())
 
         n_inner = len(self._inner_cells)
         n_vertices = len(self._inner_vertex_indices)
         n_total = self.brace_model.triangle_count
+        n_regions = len(self._inner_regions)
+        self.lbl_inner_stats.setText(
+            f"内侧面: {n_inner:,} 三角面 / {n_total:,} 总面\n"
+            f"顶点数: {n_vertices:,} | 区域数: {n_regions}"
+        )
         self.status_bar.showMessage(
             f"已选取内侧面: {n_inner:,} 三角面 / {n_total:,} 总面 "
             f"({n_inner/n_total*100:.1f}%), {n_vertices:,} 顶点, "
-            f"{len(self._inner_regions)} 个区域 (已过滤小于 150 面的碎片)"
+            f"{n_regions} 个区域 (已过滤小于 150 面的碎片)"
         )
 
     def _on_region_toggled(self, item: QListWidgetItem):
@@ -336,25 +341,17 @@ class ActionsMixin:
                 self.scene.renderer.RemoveActor(actor)
                 del self._region_actor_map[region_idx]
 
-        # 同步另一个列表的勾选状态
-        for lst in (self.region_list, self.region_list_2):
-            other_item = lst.item(region_idx)
-            if other_item is not None and other_item is not item:
-                other_item.setCheckState(item.checkState())
-
         self._render()
 
     def _select_all_regions(self):
         """全选所有区域"""
-        for lst in (self.region_list, self.region_list_2):
-            for i in range(lst.count()):
-                lst.item(i).setCheckState(Qt.Checked)
+        for i in range(self.region_list.count()):
+            self.region_list.item(i).setCheckState(Qt.Checked)
 
     def _deselect_all_regions(self):
         """全不选所有区域"""
-        for lst in (self.region_list, self.region_list_2):
-            for i in range(lst.count()):
-                lst.item(i).setCheckState(Qt.Unchecked)
+        for i in range(self.region_list.count()):
+            self.region_list.item(i).setCheckState(Qt.Unchecked)
 
     def _refresh_inner_highlight(self):
         """清除旧的内侧面高亮"""
@@ -376,23 +373,41 @@ class ActionsMixin:
         if not self._inner_regions or self._inner_vertex_indices is None:
             return None
 
-        # 收集所有勾选区域的 cell 索引
+        if self.brace_model is None or self.brace_model.polydata is None:
+            return None
+
+        # 收集所有勾选区域的 cell 索引（验证 cell ID 有效性）
+        n_cells = self.brace_model.polydata.GetNumberOfCells()
         selected_cells = set()
         for i in range(self.region_list.count()):
             item = self.region_list.item(i)
             if item.checkState() == Qt.Checked:
                 region_idx, _ = item.data(Qt.UserRole)
-                selected_cells.update(self._inner_regions[region_idx].tolist())
+                if region_idx < len(self._inner_regions):
+                    for cell_id in self._inner_regions[region_idx]:
+                        if 0 <= cell_id < n_cells:
+                            selected_cells.add(cell_id)
 
         if not selected_cells:
             return None
 
-        # 从选中的 cell 中提取顶点索引
+        # 从选中的 cell 中提取顶点索引（验证有效性）
+        n_points = self.brace_model.polydata.GetNumberOfPoints()
         selected_vertex_set = set()
         for cell_id in selected_cells:
-            cell = self.brace_model.polydata.GetCell(cell_id)
-            for j in range(cell.GetNumberOfPoints()):
-                selected_vertex_set.add(cell.GetPointId(j))
+            try:
+                cell = self.brace_model.polydata.GetCell(cell_id)
+                if cell is None:
+                    continue
+                for j in range(cell.GetNumberOfPoints()):
+                    vid = cell.GetPointId(j)
+                    if 0 <= vid < n_points:
+                        selected_vertex_set.add(vid)
+            except Exception:
+                continue
+
+        if not selected_vertex_set:
+            return None
 
         selected_indices = np.array(sorted(selected_vertex_set), dtype=np.int64)
         self._current_selected_indices = selected_indices
@@ -405,109 +420,168 @@ class ActionsMixin:
         )
 
     def _compute_distance(self):
-        """计算距离并着色"""
-        if self.foot_model is None:
-            QMessageBox.warning(self, "警告", "请先加载足部模型")
-            return
-        if self.brace_model is None:
-            QMessageBox.warning(self, "警告", "请先加载护具模型")
-            return
-        if self.distance_calc is None:
-            QMessageBox.warning(self, "警告", "足部模型未正确初始化")
-            return
+        """计算距离并着色（带完整错误保护）"""
+        try:
+            if self.foot_model is None:
+                QMessageBox.warning(self, "警告", "请先加载足部模型")
+                return
+            if self.brace_model is None:
+                QMessageBox.warning(self, "警告", "请先加载护具模型")
+                return
+            if self.distance_calc is None:
+                QMessageBox.warning(self, "警告", "足部模型未正确初始化")
+                return
+            if self.brace_model.polydata is None:
+                QMessageBox.warning(self, "警告", "护具 polydata 无效")
+                return
 
-        self.status_bar.showMessage("正在计算距离...")
-        self._render()  # 刷新UI显示进度
+            self.status_bar.showMessage("正在计算距离...")
+            self._render()  # 刷新UI显示进度
 
-        # 获取用户确认的内侧面顶点（只计算勾选的区域）
-        selected_vertices = self._get_selected_inner_vertices()
+            # 获取用户确认的内侧面顶点（只计算勾选的区域）
+            selected_vertices = self._get_selected_inner_vertices()
 
-        if selected_vertices is None or len(selected_vertices) == 0:
-            # 如果没有勾选任何区域，使用全部内侧面或全部顶点
-            if self._inner_vertex_indices is not None:
-                selected_vertices = get_transformed_vertices(
+            if selected_vertices is None or len(selected_vertices) == 0:
+                # 如果没有勾选任何区域，使用全部内侧面或全部顶点
+                if self._inner_vertex_indices is not None:
+                    # 验证索引有效性
+                    n_points = self.brace_model.polydata.GetNumberOfPoints()
+                    valid_indices = np.array(
+                        [i for i in self._inner_vertex_indices if 0 <= i < n_points],
+                        dtype=np.int64,
+                    )
+                    if len(valid_indices) == 0:
+                        self.status_bar.showMessage("计算失败：内侧面顶点索引全部无效，请重新选取内侧面")
+                        QMessageBox.warning(
+                            self, "警告",
+                            "内侧面顶点索引已失效（可能因变形操作导致），\n请重新点击「选取内侧面」后再计算。"
+                        )
+                        return
+                    selected_vertices = get_transformed_vertices(
+                        self.brace_model.polydata,
+                        valid_indices,
+                        self.brace_transform.get_matrix(),
+                    )
+                    self._current_selected_indices = valid_indices
+                else:
+                    original_vertices = _polydata_to_vertices(self.brace_model.polydata)
+                    selected_vertices = self.brace_transform.apply(original_vertices)
+                    self._current_selected_indices = None
+
+            # 最终检查：确保有顶点可计算
+            if selected_vertices is None or len(selected_vertices) == 0:
+                self.status_bar.showMessage("计算失败：无有效顶点可供计算")
+                QMessageBox.warning(self, "警告", "没有有效的顶点可供计算，请重新选取内侧面。")
+                return
+
+            # 计算有符号距离
+            stats = self.distance_calc.compute_with_stats(
+                selected_vertices, self.current_thresholds
+            )
+            self.current_distances = stats.distances
+
+            # 验证距离数组与索引长度匹配
+            if self._current_selected_indices is not None:
+                if len(self.current_distances) != len(self._current_selected_indices):
+                    # 长度不匹配，尝试修正
+                    min_len = min(len(self.current_distances), len(self._current_selected_indices))
+                    if min_len == 0:
+                        self.status_bar.showMessage("计算失败：距离数据为空")
+                        QMessageBox.warning(self, "警告", "距离计算结果为空，请检查模型状态。")
+                        return
+                    self._current_selected_indices = self._current_selected_indices[:min_len]
+                    self.current_distances = self.current_distances[:min_len]
+
+                # 应用颜色：只着色内侧面顶点
+                self.scene.apply_inner_surface_colors(
                     self.brace_model.polydata,
-                    self._inner_vertex_indices,
-                    self.brace_transform.get_matrix(),
+                    self._current_selected_indices,
+                    self.current_distances,
+                    self.current_thresholds,
                 )
-                self._current_selected_indices = self._inner_vertex_indices
             else:
-                original_vertices = _polydata_to_vertices(self.brace_model.polydata)
-                selected_vertices = self.brace_transform.apply(original_vertices)
-                self._current_selected_indices = None
+                self.scene.apply_distance_colors(
+                    self.brace_model.polydata,
+                    self.current_distances,
+                    self.current_thresholds,
+                )
 
-        # 计算有符号距离
-        stats = self.distance_calc.compute_with_stats(
-            selected_vertices, self.current_thresholds
-        )
-        self.current_distances = stats.distances
+            # 记录位置用于增量判断
+            self._last_calc_position = self.brace_transform.get_translation()
 
-        # 应用颜色：如果是内侧面，只着色内侧面顶点
-        if self._current_selected_indices is not None:
-            self.scene.apply_inner_surface_colors(
-                self.brace_model.polydata,
-                self._current_selected_indices,
-                self.current_distances,
-                self.current_thresholds,
-            )
-        else:
-            self.scene.apply_distance_colors(
-                self.brace_model.polydata,
-                self.current_distances,
-                self.current_thresholds,
+            # 更新统计信息
+            self._update_stats(stats)
+
+            # 标示最短/最长距离点
+            self._draw_min_max_indicators(selected_vertices)
+
+            self._render()
+
+            self.status_bar.showMessage(
+                f"计算完成 | 最小: {stats.min_dist:+.2f}mm | "
+                f"平均: {stats.mean_dist:+.2f}mm | "
+                f"穿透: {stats.penetration_count} 点"
             )
 
-        # 记录位置用于增量判断
-        self._last_calc_position = self.brace_transform.get_translation()
-
-        # 更新统计信息
-        self._update_stats(stats)
-
-        # 标示最短/最长距离点
-        self._draw_min_max_indicators(selected_vertices)
-
-        self._render()
-
-        self.status_bar.showMessage(
-            f"计算完成 | 最小: {stats.min_dist:+.2f}mm | "
-            f"平均: {stats.mean_dist:+.2f}mm | "
-            f"穿透: {stats.penetration_count} 点"
-        )
+        except Exception as e:
+            import traceback
+            error_detail = traceback.format_exc()
+            print(f"[ComputeDistance Error] {e}\n{error_detail}")
+            self.status_bar.showMessage("计算失败，详见错误弹窗")
+            QMessageBox.critical(
+                self, "计算失败",
+                f"距离计算过程中发生错误：\n{e}\n\n"
+                f"可能原因：\n"
+                f"1. 护具模型经过变形操作后顶点索引失效\n"
+                f"2. 内侧面数据已过期\n\n"
+                f"建议：重新选取内侧面后再试。"
+            )
+            self.current_distances = None
 
     def _draw_min_max_indicators(self, selected_vertices: np.ndarray):
-        """在场景中标示最短/最长距离点"""
+        """在场景中标示最短/最长距离点（带保护）"""
+        if selected_vertices is None or len(selected_vertices) == 0:
+            return
         if self.current_distances is None or len(self.current_distances) == 0:
             return
         if self.distance_calc is None:
             return
 
-        min_idx = int(np.argmin(self.current_distances))
-        max_idx = int(np.argmax(self.current_distances))
-        min_pos = selected_vertices[min_idx]
-        max_pos = selected_vertices[max_idx]
-        min_val = float(self.current_distances[min_idx])
-        max_val = float(self.current_distances[max_idx])
+        try:
+            # 验证索引范围
+            if len(self.current_distances) > len(selected_vertices):
+                self.current_distances = self.current_distances[:len(selected_vertices)]
 
-        # 查询足部表面上的最近点
-        closest_point = np.zeros(3, dtype=np.float64)
-        cell_id = vtk.mutable(0)
-        sub_id = vtk.mutable(0)
-        dist2 = vtk.mutable(0.0)
+            min_idx = int(np.argmin(self.current_distances))
+            max_idx = int(np.argmax(self.current_distances))
+            min_pos = selected_vertices[min_idx]
+            max_pos = selected_vertices[max_idx]
+            min_val = float(self.current_distances[min_idx])
+            max_val = float(self.current_distances[max_idx])
 
-        self.distance_calc._locator.FindClosestPoint(
-            min_pos, closest_point, cell_id, sub_id, dist2
-        )
-        min_foot_pos = closest_point.copy()
+            # 查询足部表面上的最近点
+            closest_point = np.zeros(3, dtype=np.float64)
+            cell_id = vtk.mutable(0)
+            sub_id = vtk.mutable(0)
+            dist2 = vtk.mutable(0.0)
 
-        self.distance_calc._locator.FindClosestPoint(
-            max_pos, closest_point, cell_id, sub_id, dist2
-        )
-        max_foot_pos = closest_point.copy()
+            self.distance_calc._locator.FindClosestPoint(
+                min_pos, closest_point, cell_id, sub_id, dist2
+            )
+            min_foot_pos = closest_point.copy()
 
-        self.scene.add_min_max_indicators(
-            min_pos, min_val, max_pos, max_val,
-            min_foot_pos, max_foot_pos,
-        )
+            self.distance_calc._locator.FindClosestPoint(
+                max_pos, closest_point, cell_id, sub_id, dist2
+            )
+            max_foot_pos = closest_point.copy()
+
+            self.scene.add_min_max_indicators(
+                min_pos, min_val, max_pos, max_val,
+                min_foot_pos, max_foot_pos,
+            )
+        except Exception as e:
+            print(f"[DrawMinMax Error] {e}")
+            # 静默失败，不影响主流程
 
     # ---- 护具尺寸修改 ----
 
@@ -877,23 +951,41 @@ class ActionsMixin:
         if not self._inner_regions or self._inner_vertex_indices is None:
             return None
 
-        # 收集所有勾选区域的 cell 索引
+        if self.brace_model is None or self.brace_model.polydata is None:
+            return None
+
+        # 收集所有勾选区域的 cell 索引（验证有效性）
+        n_cells = self.brace_model.polydata.GetNumberOfCells()
         selected_cells = set()
         for i in range(self.region_list.count()):
             item = self.region_list.item(i)
             if item.checkState() == Qt.Checked:
                 region_idx, _ = item.data(Qt.UserRole)
-                selected_cells.update(self._inner_regions[region_idx].tolist())
+                if region_idx < len(self._inner_regions):
+                    for cell_id in self._inner_regions[region_idx]:
+                        if 0 <= cell_id < n_cells:
+                            selected_cells.add(cell_id)
 
         if not selected_cells:
             return None
 
         # 从选中的 cell 中提取顶点索引
+        n_points = self.brace_model.polydata.GetNumberOfPoints()
         selected_vertex_set = set()
         for cell_id in selected_cells:
-            cell = self.brace_model.polydata.GetCell(cell_id)
-            for j in range(cell.GetNumberOfPoints()):
-                selected_vertex_set.add(cell.GetPointId(j))
+            try:
+                cell = self.brace_model.polydata.GetCell(cell_id)
+                if cell is None:
+                    continue
+                for j in range(cell.GetNumberOfPoints()):
+                    vid = cell.GetPointId(j)
+                    if 0 <= vid < n_points:
+                        selected_vertex_set.add(vid)
+            except Exception:
+                continue
+
+        if not selected_vertex_set:
+            return None
 
         # 将原始网格索引映射到内表面数组索引（0..N-1）
         index_map = {idx: i for i, idx in enumerate(self._inner_vertex_indices)}
@@ -1412,8 +1504,19 @@ class ActionsMixin:
         # 询问用户是否使用当前勾选的区域
         selected_vertices = self._get_selected_inner_vertices()
         if selected_vertices is None or len(selected_vertices) == 0:
-            # 使用全部内侧面
-            indices_to_use = self._inner_vertex_indices
+            # 使用全部内侧面（验证索引有效性）
+            n_points = self.brace_model.polydata.GetNumberOfPoints()
+            indices_to_use = np.array(
+                [i for i in self._inner_vertex_indices if 0 <= i < n_points],
+                dtype=np.int64,
+            )
+            if len(indices_to_use) == 0:
+                self.status_bar.showMessage("计算失败：内侧面顶点索引无效，请重新选取内侧面")
+                QMessageBox.warning(
+                    self, "警告",
+                    "内侧面顶点索引已失效，请重新点击「选取内侧面」后再计算。"
+                )
+                return
         else:
             indices_to_use = self._current_selected_indices
 
@@ -1453,38 +1556,116 @@ class ActionsMixin:
         # 重新计算距离
         self._compute_distance()
 
-        # 显示结果
-        result_text = (
-            f"{'='*35}\n"
-            f" 优化结果（径向距离）\n"
-            f"{'='*35}\n\n"
-            f"平移：X={result.translation[0]:+.2f}, "
-            f"Y={result.translation[1]:+.2f}, "
-            f"Z={result.translation[2]:+.2f} mm\n\n"
-            f"旋转：RX={result.rotation[0]:+.1f}, "
-            f"RY={result.rotation[1]:+.1f}, "
-            f"RZ={result.rotation[2]:+.1f} 度\n\n"
-            f"理想区间 (4-6mm) 覆盖率：{result.coverage_4_6mm:.1f}%\n"
-            f"理想区间点数：{result.ideal_count} / {result.total_count}\n\n"
-            f"平均径向间隙：{result.mean_distance:.2f} mm\n"
-            f"间隙标准差：{result.std_distance:.2f} mm\n"
-            f"{'='*35}"
-        )
+        # 重新计算径向距离以生成统计报告
+        transformed_brace = vtk.vtkTransformPolyDataFilter()
+        transformed_brace.SetInputData(self.brace_model.polydata)
+        transform = vtk.vtkTransform()
+        transform.SetMatrix(self.brace_transform.get_matrix().flatten())
+        transformed_brace.SetTransform(transform)
+        transformed_brace.Update()
 
-        self.stats_text.setText(result_text)
-        self.status_bar.showMessage(
-            f"优化完成 | 理想覆盖率：{result.coverage_4_6mm:.1f}% | "
-            f"平均径向间隙：{result.mean_distance:.2f}mm"
+        radial_calc = RadialDistanceCalculator(
+            foot_polydata=self.foot_model.polydata,
+            brace_polydata=transformed_brace.GetOutput(),
+            inner_vertex_indices=indices_to_use,
+            axis_direction=np.array([0.0, 0.0, 1.0]),
         )
+        radial_stats = radial_calc.compute_radial_distances(selected_vertices)
+
+        # 显示结果报告
+        self._show_optimization_report(result, radial_stats)
 
         # 弹窗提示
-        QMessageBox.information(
-            self, "优化完成",
-            f"最优位置计算完成！\n\n"
-            f"理想区间 (4-6mm) 覆盖率：{result.coverage_4_6mm:.1f}%\n"
-            f"平均径向间隙：{result.mean_distance:.2f} mm\n\n"
-            f"详细结果已显示在'统计'标签页"
+        if result.min_distance < 0:
+            QMessageBox.warning(
+                self, "优化完成（有警告）",
+                f"最优位置计算完成！\n\n"
+                f"⚠ 最小径向间隙：{result.min_distance:+.2f} mm（存在穿透）\n\n"
+                f"理想区间 (4-6mm) 覆盖率：{result.coverage_4_6mm:.1f}%\n"
+                f"平均径向间隙：{result.mean_distance:.2f} mm\n\n"
+                f"建议：手动调整护具位置，避免穿透后再运行优化。\n"
+                f"详细结果已显示在'统计'标签页"
+            )
+        else:
+            QMessageBox.information(
+                self, "优化完成",
+                f"最优位置计算完成！\n\n"
+                f"最小径向间隙：{result.min_distance:+.2f} mm\n\n"
+                f"理想区间 (4-6mm) 覆盖率：{result.coverage_4_6mm:.1f}%\n"
+                f"平均径向间隙：{result.mean_distance:.2f} mm\n\n"
+                f"详细结果已显示在'统计'标签页"
+            )
+
+    def _show_optimization_report(self, result, radial_stats):
+        """显示优化结果统计报告（含距离分布直方图）"""
+        report_text = (
+            f"{'='*45}\n"
+            f" 优化结果统计报告（径向距离）\n"
+            f"{'='*45}\n\n"
+            f"【优化位置】\n"
+            f"  平移：X={result.translation[0]:+.2f}, "
+            f"Y={result.translation[1]:+.2f}, "
+            f"Z={result.translation[2]:+.2f} mm\n"
+            f"  旋转：RX={result.rotation[0]:+.1f}°, "
+            f"RY={result.rotation[1]:+.1f}°, "
+            f"RZ={result.rotation[2]:+.1f}°\n\n"
+            f"{'='*45}\n"
+            f"【统计摘要】\n"
+            f"  平均径向间隙：{radial_stats.mean_gap:.2f} mm\n"
+            f"  标准差：{radial_stats.std_gap:.2f} mm\n"
+            f"  最小间隙：{radial_stats.min_gap:+.2f} mm\n"
+            f"  最大间隙：{radial_stats.max_gap:.2f} mm\n\n"
+            f"{'='*45}\n"
+            f"【理想区间分析 (4-6mm)】\n"
+            f"  理想区间点数：{result.ideal_count} 点\n"
+            f"  理想区间比例：{result.coverage_4_6mm:.1f}%\n"
+            f"  穿透点数：{int(np.sum(radial_stats.radial_distances < 0))} 点\n\n"
+            f"{'='*45}\n"
         )
+
+        # 距离分布直方图
+        report_text += "\n【距离分布】\n"
+        bins = [0, 2, 4, 6, 8, 10, float('inf')]
+        labels = ["0-2mm", "2-4mm", "4-6mm", "6-8mm", "8-10mm", ">10mm"]
+        n = len(radial_stats.radial_distances)
+        for i, (t_min, t_max) in enumerate(zip(bins[:-1], bins[1:])):
+            if i == 0:
+                count = int(np.sum((radial_stats.radial_distances >= t_min) & (radial_stats.radial_distances < t_max)))
+            elif i == len(labels) - 1:
+                count = int(np.sum(radial_stats.radial_distances >= t_min))
+            else:
+                count = int(np.sum((radial_stats.radial_distances >= t_min) & (radial_stats.radial_distances < t_max)))
+            ratio = count / n * 100 if n > 0 else 0
+            bar = "█" * int(ratio / 5)
+            report_text += f"  {labels[i]:>8}: {count:4} 点 ({ratio:5.1f}%) {bar}\n"
+
+        report_text += f"\n{'='*45}\n"
+        report_text += f" 总顶点数：{n}\n"
+        report_text += f" 理想覆盖率：{result.coverage_4_6mm:.1f}%\n"
+        report_text += f"{'='*45}"
+
+        self.stats_text.setText(report_text)
+
+        # 弹窗提示
+        if result.min_distance < 0:
+            QMessageBox.warning(
+                self, "优化完成（有警告）",
+                f"最优位置计算完成！\n\n"
+                f"⚠ 最小径向间隙：{result.min_distance:+.2f} mm（存在穿透）\n\n"
+                f"理想区间 (4-6mm) 覆盖率：{result.coverage_4_6mm:.1f}%\n"
+                f"平均径向间隙：{result.mean_distance:.2f} mm\n\n"
+                f"建议：手动调整护具位置，避免穿透后再运行优化。\n"
+                f"详细结果已显示在'统计'标签页"
+            )
+        else:
+            QMessageBox.information(
+                self, "优化完成",
+                f"最优位置计算完成！\n\n"
+                f"最小径向间隙：{result.min_distance:+.2f} mm\n\n"
+                f"理想区间 (4-6mm) 覆盖率：{result.coverage_4_6mm:.1f}%\n"
+                f"平均径向间隙：{result.mean_distance:.2f} mm\n\n"
+                f"详细结果已显示在'统计'标签页"
+            )
 
     def _compute_radial_distance(self):
         """基于中轴线的径向距离计算"""
@@ -1513,11 +1694,22 @@ class ActionsMixin:
             selected_vertices = self._get_selected_inner_vertices()
 
             if selected_vertices is None or len(selected_vertices) == 0:
-                # 使用全部内侧面
-                indices_to_use = self._inner_vertex_indices
+                # 使用全部内侧面（验证索引有效性）
+                n_points = self.brace_model.polydata.GetNumberOfPoints()
+                indices_to_use = np.array(
+                    [i for i in self._inner_vertex_indices if 0 <= i < n_points],
+                    dtype=np.int64,
+                )
+                if len(indices_to_use) == 0:
+                    self.status_bar.showMessage("计算失败：内侧面顶点索引无效，请重新选取内侧面")
+                    QMessageBox.warning(
+                        self, "警告",
+                        "内侧面顶点索引已失效，请重新点击「选取内侧面」后再计算。"
+                    )
+                    return
                 selected_vertices = get_transformed_vertices(
                     self.brace_model.polydata,
-                    self._inner_vertex_indices,
+                    indices_to_use,
                     self.brace_transform.get_matrix(),
                 )
             else:
@@ -1563,9 +1755,6 @@ class ActionsMixin:
             # 标示最短/最长距离点
             self._draw_min_max_indicators(selected_vertices)
 
-            # 切换到统计页面
-            self._switch_page(3)
-
             self._render()
 
             self.status_bar.showMessage(
@@ -1575,9 +1764,17 @@ class ActionsMixin:
 
         except Exception as e:
             import traceback
-            error_msg = f"计算失败：{str(e)}\n\n{traceback.format_exc()}"
-            QMessageBox.critical(self, "错误", error_msg)
-            self.status_bar.showMessage("计算失败，详见错误弹窗")
+            error_detail = traceback.format_exc()
+            print(f"[RadialDistance Error] {e}\n{error_detail}")
+            self.status_bar.showMessage("径向距离计算失败，详见错误弹窗")
+            QMessageBox.critical(
+                self, "径向距离计算失败",
+                f"计算过程中发生错误：\n{e}\n\n"
+                f"可能原因：\n"
+                f"1. 护具模型经过变形操作后顶点索引失效\n"
+                f"2. 内侧面数据已过期\n\n"
+                f"建议：重新选取内侧面后再试。"
+            )
 
     def _update_radial_stats(self, stats):
         """更新径向距离统计信息显示"""
@@ -1662,39 +1859,57 @@ class ActionsMixin:
             self.lbl_vertices.setText(" | ".join(parts))
 
     def _update_stats(self, stats):
-        """更新统计信息面板"""
+        """更新统计信息面板（含距离分布直方图）"""
         distances = stats.distances
         total = len(distances)
 
-        # 统计各区间点数和百分比
-        penetration = int(np.sum(distances < 0))
-        contact = int(np.sum((distances >= 0) & (distances < 4)))
-        ideal = int(np.sum((distances >= 4) & (distances <= 6)))
-        loose = int(np.sum((distances > 6) & (distances < 10)))
-        too_loose = int(np.sum(distances >= 10))
-
-        text = (
-            f"{'='*35}\n"
-            f" 距离统计 (单位：mm)\n"
-            f"{'='*35}\n"
-            f" 最小距离：  {stats.min_dist:+.2f}\n"
-            f" 最大距离：  {stats.max_dist:+.2f}\n"
-            f" 平均距离：  {stats.mean_dist:+.2f}\n"
-            f" 中位数：    {stats.median_dist:+.2f}\n"
-            f" 标准差：    {stats.std_dist:.2f}\n"
-            f"{'='*35}\n"
-            f" 距离分布统计:\n"
-            f"  穿透 (<0):      {penetration:5d} 点 ({penetration/total*100:5.1f}%)\n"
-            f"  偏紧 (0-4):     {contact:5d} 点 ({contact/total*100:5.1f}%)\n"
-            f"  理想 (4-6):     {ideal:5d} 点 ({ideal/total*100:5.1f}%)\n"
-            f"  偏松 (6-10):    {loose:5d} 点 ({loose/total*100:5.1f}%)\n"
-            f"  过松 (>10):     {too_loose:5d} 点 ({too_loose/total*100:5.1f}%)\n"
-            f"{'='*35}\n"
-            f" 总顶点数：  {total}\n"
-            f" 理想覆盖率：{ideal/total*100:.1f}%\n"
-            f"{'='*35}"
+        report_text = (
+            f"{'='*45}\n"
+            f" 有符号距离分析报告\n"
+            f"{'='*45}\n\n"
+            f"【统计摘要】\n"
+            f"  平均距离：{stats.mean_dist:+.2f} mm\n"
+            f"  中位数：{stats.median_dist:+.2f} mm\n"
+            f"  标准差：{stats.std_dist:.2f} mm\n"
+            f"  最小距离：{stats.min_dist:+.2f} mm\n"
+            f"  最大距离：{stats.max_dist:+.2f} mm\n\n"
+            f"{'='*45}\n"
+            f"【理想区间分析 (4-6mm)】\n"
         )
-        self.stats_text.setText(text)
+
+        if total > 0:
+            ideal = int(np.sum((distances >= 4) & (distances <= 6)))
+            penetration = int(np.sum(distances < 0))
+            report_text += (
+                f"  理想区间点数：{ideal} 点\n"
+                f"  理想区间比例：{ideal/total*100:.1f}%\n"
+                f"  穿透点数：{penetration} 点\n\n"
+            )
+        else:
+            report_text += "  无数据\n\n"
+
+        report_text += f"{'='*45}\n"
+        report_text += "\n【距离分布】\n"
+        bins = [float('-inf'), 0, 2, 4, 6, 8, 10, float('inf')]
+        labels = ["穿透(<0)", "0-2mm", "2-4mm", "4-6mm", "6-8mm", "8-10mm", ">10mm"]
+        for i, (t_min, t_max) in enumerate(zip(bins[:-1], bins[1:])):
+            if i == 0:
+                count = int(np.sum(distances < t_max))
+            elif i == len(labels) - 1:
+                count = int(np.sum(distances >= t_min))
+            else:
+                count = int(np.sum((distances >= t_min) & (distances < t_max)))
+            ratio = count / total * 100 if total > 0 else 0
+            bar = "█" * int(ratio / 5)
+            report_text += f"  {labels[i]:>8}: {count:4} 点 ({ratio:5.1f}%) {bar}\n"
+
+        report_text += f"\n{'='*45}\n"
+        report_text += f" 总顶点数：{total}\n"
+        if total > 0:
+            report_text += f" 理想覆盖率：{int(np.sum((distances >= 4) & (distances <= 6)))/total*100:.1f}%\n"
+        report_text += f"{'='*45}"
+
+        self.stats_text.setText(report_text)
 
 
     def _on_preset_changed(self, preset_name: str):

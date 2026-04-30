@@ -1,234 +1,40 @@
 """主窗口 — 包含 3D 视图、控制面板和状态栏"""
 
-import os
-import tempfile
-from pathlib import Path
 from typing import Optional
 
 import numpy as np
-import vtk
-from PyQt5.QtCore import Qt, QTimer, QEvent, QThread, pyqtSignal, QProcess
-from PyQt5.QtGui import QColor, QFont
-from PyQt5.QtWidgets import (
-    QAction,
-    QComboBox,
-    QDoubleSpinBox,
-    QFileDialog,
-    QGroupBox,
-    QHBoxLayout,
-    QLabel,
-    QListWidget,
-    QListWidgetItem,
-    QMainWindow,
-    QMessageBox,
-    QProgressDialog,
-    QPushButton,
-    QStackedWidget,
-    QStatusBar,
-    QTableWidget,
-    QTableWidgetItem,
-    QTextEdit,
-    QVBoxLayout,
-    QWidget,
-)
-from vtk.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
+from PyQt5.QtCore import Qt, QEvent
+from PyQt5.QtWidgets import QAction, QMainWindow
 
 from src.config import (
     DEFAULT_MOVE_STEP,
-    FINE_MOVE_STEP,
     DEFAULT_ROTATE_STEP,
-    FINE_ROTATE_STEP,
     PRESET_THRESHOLDS,
     DEFAULT_PRESET,
 )
 from src.version import __version__
-from src.core.model_loader import ModelData, load_stl
+from src.core.model_loader import ModelData
 from src.core.transform_manager import TransformManager
-from src.core.distance_calculator import DistanceCalculator
-from src.core.optimizer import BraceOptimizer
-from src.core.radial_distance_calculator import RadialDistanceCalculator, AxisCalculator
-from src.core.surface_picker import (
-    identify_inner_surface,
-    extract_inner_vertices,
-    get_transformed_vertices,
-    find_connected_regions,
-)
-from src.core.position_file_manager import PositionFileManager
 from src.core.distance_measurement import DistanceMeasurement
-from src.core.deformation_engine import DeformationEngine, DeformationParams
-from src.core.deformation_state import DeformationState, DeformationStep
-from src.core.step_converter import step_to_stl, stl_to_step, get_step_info
+from src.core.deformation_engine import DeformationEngine
+from src.core.radial_distance_calculator import RadialDistanceCalculator
+from src.core.distance_calculator import DistanceCalculator
+from src.core.deformation_state import DeformationState
+from src.core.position_file_manager import PositionFileManager
 from src.render.scene_manager import SceneManager
 from src.render.interactor_style import BraceCameraInteractorStyle
 from src.ui.ui_builder import UIBuilderMixin
-from src.ui.actions import ActionsMixin
+from src.ui.actions_model import ActionsModelMixin
+from src.ui.actions_inner import ActionsInnerMixin
+from src.ui.actions_analysis import ActionsAnalysisMixin
+from src.ui.actions_deformation import ActionsDeformationMixin
+from src.ui.actions_position import ActionsPositionMixin
+from src.ui.actions_tools import ActionsToolsMixin
 
 
-class FreeCADWorker(QThread):
-    """后台线程：执行 FreeCAD STEP→STL 转换（使用 QProcess 支持取消）"""
-    progress = pyqtSignal(str)  # 进度消息
-    finished = pyqtSignal(str)  # 输出 STL 路径
-    error = pyqtSignal(str)     # 错误信息
-
-    FREECAD_CMD = "/Applications/FreeCAD.app/Contents/Resources/bin/freecadcmd"
-
-    def __init__(self, step_path: str, stl_path: str, parent=None):
-        super().__init__(parent)
-        self.step_path = step_path
-        self.stl_path = stl_path
-        self._process = None
-        self._temp_script = None
-        self._cancelled = False
-
-    def cancel(self):
-        """取消转换，终止 FreeCAD 进程"""
-        self._cancelled = True
-        if self._process and self._process.state() == QProcess.Running:
-            self._process.kill()
-
-    def run(self):
-        if self._cancelled:
-            return
-
-        # 检查缓存
-        if os.path.exists(self.stl_path):
-            step_mtime = os.path.getmtime(self.step_path)
-            stl_mtime = os.path.getmtime(self.stl_path)
-            if stl_mtime >= step_mtime:
-                self.progress.emit("使用已转换的 STL 缓存")
-                self.finished.emit(self.stl_path)
-                return
-
-        script = f"""
-import Part, os, FreeCAD, sys
-step_path = {self.step_path!r}
-stl_path = {self.stl_path!r}
-try:
-    shape = Part.read(step_path)
-    doc = FreeCAD.newDocument('StepConvert')
-    obj = doc.addObject('Part::Feature', 'Shape')
-    obj.Shape = shape
-    doc.recompute()
-    shape.tessellate(0.05)
-    Part.export([obj], stl_path)
-except Exception as e:
-    print(f'ERROR: {{e}}', file=sys.stderr)
-    sys.exit(1)
-finally:
-    try:
-        FreeCAD.closeDocument(doc.Name)
-    except Exception:
-        pass
-"""
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".py", delete=False
-        ) as f:
-            f.write(script)
-            f.flush()
-            self._temp_script = f.name
-
-        try:
-            self._process = QProcess()
-            self._process.setProcessChannelMode(QProcess.MergedChannels)
-
-            output_lines = []
-
-            def on_ready_read():
-                data = self._process.readAllStandardOutput().data().decode('utf-8', errors='replace')
-                output_lines.append(data)
-                if "Reading" in data or "read" in data.lower():
-                    self.progress.emit("正在读取 STEP 几何...")
-                elif "Meshing" in data or "tessellate" in data:
-                    self.progress.emit("正在网格化导出...")
-
-            self._process.readyReadStandardOutput.connect(on_ready_read)
-
-            self._process.start(
-                self.FREECAD_CMD, [self._temp_script]
-            )
-            self._process.waitForFinished(-1)
-
-            if self._cancelled:
-                self.error.emit("用户已取消转换")
-                return
-
-            exit_code = self._process.exitCode()
-            if exit_code != 0:
-                stderr = self._process.readAllStandardError().data().decode(
-                    'utf-8', errors='replace'
-                )
-                raise RuntimeError(
-                    f"FreeCAD 执行失败 (code={exit_code}):\n{stderr[-2000:]}"
-                )
-            self.finished.emit(self.stl_path)
-        except RuntimeError:
-            raise
-        except Exception as e:
-            self.error.emit(str(e))
-        finally:
-            if self._temp_script and os.path.exists(self._temp_script):
-                os.unlink(self._temp_script)
-
-
-class _BraceToStepWorker(QThread):
-    """后台线程：将当前 VTK 护具 polydata 转换为 STEP 再网格化"""
-    progress = pyqtSignal(str)
-    finished = pyqtSignal(str)  # 输出 STL 路径
-    error = pyqtSignal(str)
-
-    def __init__(self, polydata: vtk.vtkPolyData, stl_path: str):
-        super().__init__()
-        self.polydata = polydata
-        self.stl_path = stl_path
-        self._cancelled = False
-
-    def cancel(self):
-        """取消转换"""
-        self._cancelled = True
-
-    def run(self):
-        try:
-            import tempfile
-
-            # 1. 导出临时 STL
-            temp_stl = self.stl_path + ".orig.stl"
-            writer = vtk.vtkSTLWriter()
-            writer.SetFileName(temp_stl)
-            writer.SetInputData(self.polydata)
-            writer.Write()
-
-            if self._cancelled:
-                return
-
-            self.progress.emit("正在转换为 STEP...")
-            # 2. STL → STEP
-            step_path = stl_to_step(temp_stl, tolerance=0.1)
-
-            if self._cancelled:
-                return
-
-            self.progress.emit("正在高精度网格化...")
-            # 3. STEP → 高精度 STL
-            step_to_stl(step_path, self.stl_path, linear_deflection=0.05)
-
-            if self._cancelled:
-                return
-
-            # 清理临时文件
-            for f in [temp_stl, step_path]:
-                if os.path.exists(f):
-                    os.unlink(f)
-
-            self.finished.emit(self.stl_path)
-        except Exception as e:
-            if self._cancelled:
-                self.error.emit("用户已取消转换")
-            else:
-                self.error.emit(str(e))
-
-
-
-class MainWindow(UIBuilderMixin, ActionsMixin, QMainWindow):
+class MainWindow(UIBuilderMixin, ActionsModelMixin, ActionsInnerMixin,
+                 ActionsAnalysisMixin, ActionsDeformationMixin,
+                 ActionsPositionMixin, ActionsToolsMixin, QMainWindow):
     """AnklePro 主窗口"""
 
     def __init__(self):
@@ -289,11 +95,6 @@ class MainWindow(UIBuilderMixin, ActionsMixin, QMainWindow):
         self._deformed_inner_vertices: Optional[np.ndarray] = None  # 变形后的内表面顶点位置
         self._preview_vertices: Optional[np.ndarray] = None  # 当前预览的顶点位置
         self._brace_step_filepath: Optional[str] = None  # 护具 STEP 文件路径
-
-        self._setup_ui()
-        self._setup_menu()
-        self._setup_vtk()
-        self.scene.add_help_text(True)
 
         self._setup_ui()
         self._setup_menu()
@@ -532,13 +333,4 @@ class MainWindow(UIBuilderMixin, ActionsMixin, QMainWindow):
         if self.render_window:
             self.render_window.Render()
 
-
-def _polydata_to_vertices(polydata: vtk.vtkPolyData) -> np.ndarray:
-    """提取 vtkPolyData 的顶点数组 (N, 3)"""
-    points = polydata.GetPoints()
-    n = points.GetNumberOfPoints()
-    vertices = np.zeros((n, 3), dtype=np.float64)
-    for i in range(n):
-        vertices[i] = points.GetPoint(i)
-    return vertices
 
