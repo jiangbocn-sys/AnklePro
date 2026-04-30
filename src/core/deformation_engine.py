@@ -211,12 +211,11 @@ class DeformationEngine:
         else:
             center = np.mean(self._inner_vertices, axis=0)
 
-        # ---- 动态衰减半径（与 directional 一致） ----
-        inner_extent = np.ptp(self._inner_vertices, axis=0).max()
+        # ---- 动态衰减半径 ----
         if params.decay_radius > 0:
-            effective_radius = max(params.decay_radius, inner_extent * 0.8)
+            effective_radius = max(params.decay_radius, 3.0)
         else:
-            effective_radius = inner_extent * 1.2
+            effective_radius = np.ptp(self._inner_vertices, axis=0).max() * 1.2
 
         # ---- 所有顶点统一平滑权重场（基于到中心的距离） ----
         distances = np.linalg.norm(vertices - center, axis=1)
@@ -400,12 +399,11 @@ class DeformationEngine:
         else:
             center = np.mean(self._inner_vertices, axis=0)
 
-        # ---- 动态衰减半径（与 directional 一致） ----
-        inner_extent = np.ptp(self._inner_vertices, axis=0).max()
+        # ---- 动态衰减半径 ----
         if params.decay_radius > 0:
-            effective_radius = max(params.decay_radius, inner_extent * 0.8)
+            effective_radius = max(params.decay_radius, 3.0)
         else:
-            effective_radius = inner_extent * 1.2
+            effective_radius = np.ptp(self._inner_vertices, axis=0).max() * 1.2
 
         # ---- 所有顶点统一平滑权重场（基于到中心的距离） ----
         distances = np.linalg.norm(vertices - center, axis=1)

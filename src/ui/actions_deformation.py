@@ -55,7 +55,7 @@ class ActionsDeformationMixin:
             self.lbl_deform_offset.setText("偏移量 (mm):  正数=向外扩张，负数=向内收缩")
             self.spin_deform_offset.setVisible(True)
             self.lbl_deform_offset.setVisible(True)
-            self.lbl_deform_decay.setText("衰减半径 (mm, 0=整个选区均匀变形):")
+            self.lbl_deform_decay.setText("衰减半径 (mm, 0=均匀变形, 最小3mm):")
             self.spin_deform_decay.setVisible(True)
             self.lbl_deform_decay.setVisible(True)
             self.spin_deform_offset.setRange(-20.0, 20.0)
@@ -67,7 +67,7 @@ class ActionsDeformationMixin:
             self.lbl_deform_offset.setText("偏移量 (mm):  正数=向外扩张，负数=向内收缩")
             self.spin_deform_offset.setVisible(True)
             self.lbl_deform_offset.setVisible(True)
-            self.lbl_deform_decay.setText("衰减半径 (mm, 0=整个选区均匀变形):")
+            self.lbl_deform_decay.setText("衰减半径 (mm, 0=均匀变形, 最小3mm):")
             self.spin_deform_decay.setVisible(True)
             self.lbl_deform_decay.setVisible(True)
             self.spin_deform_offset.setRange(-20.0, 20.0)
@@ -79,7 +79,7 @@ class ActionsDeformationMixin:
             self.lbl_deform_offset.setText("缩放比例 (%):  正数=放大，负数=缩小")
             self.spin_deform_offset.setVisible(True)
             self.lbl_deform_offset.setVisible(True)
-            self.lbl_deform_decay.setText("衰减半径 (mm, 0=整个选区均匀缩放):")
+            self.lbl_deform_decay.setText("衰减半径 (mm, 0=均匀缩放, 最小3mm):")
             self.spin_deform_decay.setVisible(True)
             self.lbl_deform_decay.setVisible(True)
             self.spin_deform_offset.setRange(-50.0, 50.0)
@@ -234,6 +234,9 @@ class ActionsDeformationMixin:
             self.status_bar.showMessage("错误：请先选取内侧面")
             return
 
+        # 确保变形引擎已初始化（用于对比计算）
+        self._ensure_deformation_engine()
+
         # 优先使用已有距离计算的最短距离点
         if self.current_distances is not None and len(self.current_distances) > 0:
             min_idx_in_distances = int(np.argmin(self.current_distances))
@@ -245,7 +248,51 @@ class ActionsDeformationMixin:
                     self._deform_point_idx = index_map[global_idx]
                     verts = self._deformed_inner_vertices if self._deformed_inner_vertices is not None else self._base_inner_vertices
                     pos = verts[self._deform_point_idx]
-                    print(f"使用最短距离点: 内表面 idx={self._deform_point_idx}, 距离={self.current_distances[min_idx_in_distances]:+.2f}mm")
+
+                    # 对比：如果不使用 current_distances，自动选点会找到哪个点
+                    selected_indices = self._get_selected_region_indices()
+                    if selected_indices is None or len(selected_indices) == 0:
+                        selected_indices = np.arange(len(self._inner_vertex_indices), dtype=np.int64)
+
+                    # 获取距离计算时用的顶点（世界坐标，含brace_transform）
+                    from src.core.surface_picker import get_transformed_vertices
+                    if len(self._current_selected_indices) > 0:
+                        calc_verts = get_transformed_vertices(
+                            self.brace_model.polydata,
+                            self._current_selected_indices,
+                            self.brace_transform.get_matrix(),
+                        )
+                    else:
+                        calc_verts = verts  # fallback
+
+                    # 自动选点用的顶点（局部坐标）
+                    auto_verts = verts[selected_indices]
+
+                    # 用两个不同的 locator 分别计算
+                    foot_points_calc = self.distance_calc._locator.FindClosestPoint if hasattr(self, 'distance_calc') and self.distance_calc else None
+                    print(f"[对比] 距离计算顶点数={len(calc_verts)}, 自动选点顶点数={len(auto_verts)}")
+                    print(f"[对比] brace_transform = {self.brace_transform.get_matrix()}")
+                    if foot_points_calc is not None:
+                        # 距离计算的 MIN 点在 calc_verts 中的局部坐标
+                        min_pos_calc = calc_verts[min_idx_in_distances]
+                        print(f"[对比] 距离计算 MIN 世界坐标: ({min_pos_calc[0]:.1f}, {min_pos_calc[1]:.1f}, {min_pos_calc[2]:.1f})")
+                        # 自动选点的 MIN 点在 auto_verts 中的局部坐标
+                        auto_closest = int(np.argmin(gaps))
+                        auto_pos = auto_verts[auto_closest]
+                        print(f"[对比] 自动选点最近 局部坐标: ({auto_pos[0]:.1f}, {auto_pos[1]:.1f}, {auto_pos[2]:.1f})")
+                        # 用距离计算用的 locator 重新计算自动选点顶点的最近距离
+                        from src.core.distance_calculator import DistanceCalculator
+                        dc = self.distance_calc
+                        if dc is not None:
+                            closest_point = np.zeros(3, dtype=np.float64)
+                            cell_id = vtk.mutable(0)
+                            sub_id = vtk.mutable(0)
+                            dist2 = vtk.mutable(0.0)
+                            dc._locator.FindClosestPoint(auto_pos, closest_point, cell_id, sub_id, dist2)
+                            dist_via_dc = np.sqrt(float(dist2))
+                            print(f"[对比] 用距离计算器的locator，auto_pos距足部: {dist_via_dc:.2f}mm")
+
+                    print(f"[自动选点] 使用最短距离点: 内表面 idx={self._deform_point_idx}, 距离={self.current_distances[min_idx_in_distances]:+.2f}mm")
                     self.lbl_deform_point.setText(
                         f"idx={self._deform_point_idx} ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})"
                     )
@@ -271,8 +318,26 @@ class ActionsDeformationMixin:
             verts[selected_indices] - foot_points, axis=1
         )
         region_closest = int(np.argmin(gaps))
-        self._deform_point_idx = int(selected_indices[region_closest])
+        auto_idx = int(selected_indices[region_closest])
 
+        # 对比：如果优先使用 current_distances 会得到什么结果
+        if self.current_distances is not None and len(self.current_distances) > 0:
+            min_idx_dist = int(np.argmin(self.current_distances))
+            if hasattr(self, '_current_selected_indices') and self._current_selected_indices is not None:
+                global_dist = int(self._current_selected_indices[min_idx_dist])
+                index_map = {idx: i for i, idx in enumerate(self._inner_vertex_indices)}
+                if global_dist in index_map:
+                    dist_idx = index_map[global_dist]
+                    print(f"[对比] 距离计算 MIN: 内表面 idx={dist_idx}, signed_dist={self.current_distances[min_idx_dist]:+.2f}mm")
+                    print(f"[对比] 自动选点最近: 内表面 idx={auto_idx}, 几何距={gaps[region_closest]:.2f}mm")
+                    if dist_idx != auto_idx:
+                        print(f"  → 两个算法找到了不同的点！差值 idx={abs(dist_idx - auto_idx)}")
+                        pos_dist = verts[dist_idx]
+                        pos_auto = verts[auto_idx]
+                        print(f"  → 距离计算位置: ({pos_dist[0]:.1f}, {pos_dist[1]:.1f}, {pos_dist[2]:.1f})")
+                        print(f"  → 自动选点位置: ({pos_auto[0]:.1f}, {pos_auto[1]:.1f}, {pos_auto[2]:.1f})")
+
+        self._deform_point_idx = auto_idx
         pos = verts[self._deform_point_idx]
         print(f"自动选点(重算): 内表面 idx={self._deform_point_idx}, 距足部 {gaps[region_closest]:.2f}mm, 位置=({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})")
         self.lbl_deform_point.setText(

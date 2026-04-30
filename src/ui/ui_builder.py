@@ -433,7 +433,7 @@ class UIBuilderMixin:
         deform_layout.addWidget(self.spin_deform_offset)
 
         # 衰减半径
-        self.lbl_deform_decay = QLabel("衰减半径 (mm, 0=整个选区均匀变形):")
+        self.lbl_deform_decay = QLabel("衰减半径 (mm, 0=均匀变形, 最小3mm):")
         deform_layout.addWidget(self.lbl_deform_decay)
         self.spin_deform_decay = QDoubleSpinBox()
         self.spin_deform_decay.setRange(0.0, 100.0)
