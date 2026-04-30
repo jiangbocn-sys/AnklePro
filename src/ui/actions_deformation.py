@@ -52,10 +52,13 @@ class ActionsDeformationMixin:
 
         if mode in ("normal", "normal_z"):
             # 法向变形：偏移量 (mm) + 衰减半径
-            self.lbl_deform_offset.setText("偏移量 (mm):  正数=向外扩张，负数=向内收缩")
+            if mode == "normal":
+                self.lbl_deform_offset.setText("偏移量 (mm): 正=向外扩张，负=向内收缩（质心放射）")
+            else:
+                self.lbl_deform_offset.setText("偏移量 (mm): 正=向外扩张，负=向内收缩（Z轴圆柱）")
             self.spin_deform_offset.setVisible(True)
             self.lbl_deform_offset.setVisible(True)
-            self.lbl_deform_decay.setText("衰减半径 (mm, 0=均匀变形, 最小3mm):")
+            self.lbl_deform_decay.setText("衰减半径 (mm, 0=均匀变形; ≥模型尺寸80%时生效，建议0=均匀):")
             self.spin_deform_decay.setVisible(True)
             self.lbl_deform_decay.setVisible(True)
             self.spin_deform_offset.setRange(-20.0, 20.0)
@@ -64,10 +67,10 @@ class ActionsDeformationMixin:
 
         elif mode == "directional":
             # 方向拉伸：偏移量 (mm) + 衰减半径
-            self.lbl_deform_offset.setText("偏移量 (mm):  正数=向外扩张，负数=向内收缩")
+            self.lbl_deform_offset.setText("偏移量 (mm): 正=向外扩张，负=向内收缩（选点驱动）")
             self.spin_deform_offset.setVisible(True)
             self.lbl_deform_offset.setVisible(True)
-            self.lbl_deform_decay.setText("衰减半径 (mm, 0=均匀变形, 最小3mm):")
+            self.lbl_deform_decay.setText("衰减半径 (mm, 0=均匀变形; ≥模型尺寸80%时生效，建议0=均匀):")
             self.spin_deform_decay.setVisible(True)
             self.lbl_deform_decay.setVisible(True)
             self.spin_deform_offset.setRange(-20.0, 20.0)
@@ -76,10 +79,10 @@ class ActionsDeformationMixin:
 
         elif mode == "radial":
             # 径向缩放：缩放比例 (%) + 衰减半径
-            self.lbl_deform_offset.setText("缩放比例 (%):  正数=放大，负数=缩小")
+            self.lbl_deform_offset.setText("缩放比例 (%): 正=径向放大，负=径向缩小（沿选中轴）")
             self.spin_deform_offset.setVisible(True)
             self.lbl_deform_offset.setVisible(True)
-            self.lbl_deform_decay.setText("衰减半径 (mm, 0=均匀缩放, 最小3mm):")
+            self.lbl_deform_decay.setText("衰减半径 (mm, 0=均匀缩放; ≥模型尺寸80%时生效，建议0=均匀):")
             self.spin_deform_decay.setVisible(True)
             self.lbl_deform_decay.setVisible(True)
             self.spin_deform_offset.setRange(-50.0, 50.0)
@@ -267,6 +270,11 @@ class ActionsDeformationMixin:
 
                     # 自动选点用的顶点（局部坐标）
                     auto_verts = verts[selected_indices]
+
+                    # 自动选点用的几何距离
+                    if self.deformation_engine is not None:
+                        foot_points = self.deformation_engine._find_closest_foot_points(auto_verts)
+                        gaps = np.linalg.norm(auto_verts - foot_points, axis=1)
 
                     # 用两个不同的 locator 分别计算
                     foot_points_calc = self.distance_calc._locator.FindClosestPoint if hasattr(self, 'distance_calc') and self.distance_calc else None
