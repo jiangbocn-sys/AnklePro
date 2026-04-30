@@ -48,6 +48,7 @@ class UIBuilderMixin:
 
         # 导航按钮 — 纵向文字（每个字一行）
         self._nav_buttons: list = []
+        self._nav_page_to_button: dict = {}  # page index → button index
         nav_items = [
             ("模型加载", 0),
             ("内侧面", 1),
@@ -66,6 +67,7 @@ class UIBuilderMixin:
             btn.clicked.connect(lambda _, i=idx: self._switch_page(i))
             side_layout.addWidget(btn)
             self._nav_buttons.append(btn)
+            self._nav_page_to_button[idx] = len(self._nav_buttons) - 1
             if text in ("模型加载",):
                 side_layout.addSpacing(8)
         side_layout.addStretch()
@@ -499,8 +501,9 @@ class UIBuilderMixin:
     def _switch_page(self, index: int):
         """切换到指定页面，同时更新导航按钮高亮"""
         self.stack.setCurrentIndex(index)
+        btn_idx = self._nav_page_to_button.get(index, 0)
         for i, btn in enumerate(self._nav_buttons):
-            checked = (i == index)
+            checked = (i == btn_idx)
             btn.setChecked(checked)
             btn.setStyleSheet(self._nav_button_style(checked))
 
