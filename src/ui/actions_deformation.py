@@ -217,7 +217,46 @@ class ActionsDeformationMixin:
         self._update_deform_point_marker()
 
     def _select_closest_to_foot(self):
-        if self.deformation_engine is None or self._inner_vertex_indices is None:
+        """自动选距足部最近的点作为变形中心
+
+        优先使用已有距离计算中的最短距离点（与贴合分析中标注的最短距离点一致），
+        如果没有距离计算结果则重新计算。
+        """
+        if self.foot_model is None:
+            self.status_bar.showMessage("错误：请先加载足部模型")
+            return
+
+        if self.brace_model is None:
+            self.status_bar.showMessage("错误：请先加载护具模型")
+            return
+
+        if self._inner_vertex_indices is None or len(self._inner_vertex_indices) == 0:
+            self.status_bar.showMessage("错误：请先选取内侧面")
+            return
+
+        # 优先使用已有距离计算的最短距离点
+        if self.current_distances is not None and len(self.current_distances) > 0:
+            min_idx_in_distances = int(np.argmin(self.current_distances))
+            # _current_selected_indices 是全局网格索引，映射到内表面数组索引
+            if hasattr(self, '_current_selected_indices') and self._current_selected_indices is not None:
+                global_idx = int(self._current_selected_indices[min_idx_in_distances])
+                index_map = {idx: i for i, idx in enumerate(self._inner_vertex_indices)}
+                if global_idx in index_map:
+                    self._deform_point_idx = index_map[global_idx]
+                    verts = self._deformed_inner_vertices if self._deformed_inner_vertices is not None else self._base_inner_vertices
+                    pos = verts[self._deform_point_idx]
+                    print(f"使用最短距离点: 内表面 idx={self._deform_point_idx}, 距离={self.current_distances[min_idx_in_distances]:+.2f}mm")
+                    self.lbl_deform_point.setText(
+                        f"idx={self._deform_point_idx} ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})"
+                    )
+                    self.lbl_deform_point.setStyleSheet("color: #4a4;")
+                    self._update_deform_point_marker()
+                    return
+
+        # 没有距离计算结果，重新计算最近点
+        self._ensure_deformation_engine()
+        if self.deformation_engine is None:
+            self.status_bar.showMessage("错误：变形引擎初始化失败")
             return
 
         selected_indices = self._get_selected_region_indices()
@@ -234,8 +273,8 @@ class ActionsDeformationMixin:
         region_closest = int(np.argmin(gaps))
         self._deform_point_idx = int(selected_indices[region_closest])
 
-        print(f"自动选点: 内表面 idx={self._deform_point_idx}, 距足部 {gaps[region_closest]:.2f}mm")
         pos = verts[self._deform_point_idx]
+        print(f"自动选点(重算): 内表面 idx={self._deform_point_idx}, 距足部 {gaps[region_closest]:.2f}mm, 位置=({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})")
         self.lbl_deform_point.setText(
             f"idx={self._deform_point_idx} ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})"
         )
