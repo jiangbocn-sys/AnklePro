@@ -52,9 +52,9 @@ class UIBuilderMixin:
             ("模型加载", 0),
             ("内侧面", 1),
             ("贴合分析", 2),
-            ("显示设置", 3),
-            ("统计结果", 4),
             ("尺寸修改", 5),
+            ("统计结果", 4),
+            ("显示设置", 3),
         ]
         for text, idx in nav_items:
             btn = QPushButton("\n".join(text))
@@ -357,7 +357,8 @@ class UIBuilderMixin:
 
         self.combo_deform_mode = QComboBox()
         self.combo_deform_mode.addItems([
-            "法向变形（整体膨胀/收缩）",
+            "法向变形（质心放射）",
+            "法向变形（Z轴圆柱）",
             "方向拉伸（沿指定方向）",
             "径向缩放（绕中轴线）",
             "自适应（目标间隙）",
@@ -383,6 +384,20 @@ class UIBuilderMixin:
         self.dir_group.setLayout(dir_layout)
         self.dir_group.setVisible(False)
         deform_layout.addWidget(self.dir_group)
+
+        # 径向轴选择（仅径向缩放模式可见）
+        self.radial_group = QGroupBox("径向轴")
+        radial_layout = QVBoxLayout()
+        self._radial_axis = QComboBox()
+        self._radial_axis.addItem("PCA 中轴线（默认）")
+        self._radial_axis.addItem("X 轴 (1, 0, 0)")
+        self._radial_axis.addItem("Y 轴 (0, 1, 0)")
+        self._radial_axis.addItem("Z 轴 (0, 0, 1)")
+        radial_layout.addWidget(self._radial_axis)
+        radial_layout.addWidget(QLabel("径向轴决定缩放的方向，模型沿垂直于轴的平面内缩放"))
+        self.radial_group.setLayout(radial_layout)
+        self.radial_group.setVisible(False)
+        deform_layout.addWidget(self.radial_group)
 
         # 变形方向提示
         self.lbl_deform_direction = QLabel("方向：用偏移量正负号控制（正=向外扩张，负=向内收缩）")

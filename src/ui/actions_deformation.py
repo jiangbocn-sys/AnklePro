@@ -16,12 +16,13 @@ class ActionsDeformationMixin:
 
     def _on_deform_mode_changed(self):
         idx = self.combo_deform_mode.currentIndex()
-        modes = ["normal", "directional", "radial", "adaptive"]
+        modes = ["normal", "normal_z", "directional", "radial", "adaptive"]
         self._deform_mode = modes[idx]
 
         # 方向选择 / 选点控件：仅 direction 模式可见
         self.dir_group.setVisible(self._deform_mode == "directional")
         self.point_group.setVisible(self._deform_mode == "directional")
+        self.radial_group.setVisible(self._deform_mode == "radial")
 
         # 根据模式调整参数控件的标签和可见性
         self._update_deform_param_controls()
@@ -33,9 +34,11 @@ class ActionsDeformationMixin:
             if self._deform_point_idx < 0:
                 self._select_closest_to_foot()
         elif self._deform_mode == "normal":
-            self.lbl_deform_direction.setText("方向：用偏移量正负号控制（正=向外扩张，负=向内收缩）")
+            self.lbl_deform_direction.setText("方向：用偏移量正负号控制（正=向外扩张，负=向内收缩）— 质心放射")
+        elif self._deform_mode == "normal_z":
+            self.lbl_deform_direction.setText("方向：用偏移量正负号控制（正=向外扩张，负=向内收缩）— 沿Z轴圆柱")
         elif self._deform_mode == "radial":
-            self.lbl_deform_direction.setText("方向：绕中轴线径向缩放")
+            self.lbl_deform_direction.setText("方向：沿选中轴的径向缩放")
         elif self._deform_mode == "adaptive":
             self.lbl_deform_direction.setText("方向：自动计算偏移量，使平均间隙接近目标值")
 
@@ -47,7 +50,7 @@ class ActionsDeformationMixin:
         """根据当前变形模式调整参数控件的显示"""
         mode = self._deform_mode
 
-        if mode == "normal":
+        if mode in ("normal", "normal_z"):
             # 法向变形：偏移量 (mm) + 衰减半径
             self.lbl_deform_offset.setText("偏移量 (mm):  正数=向外扩张，负数=向内收缩")
             self.spin_deform_offset.setVisible(True)
@@ -104,6 +107,19 @@ class ActionsDeformationMixin:
             np.array([0.0, -1.0, 0.0]),
             np.array([0.0, 0.0, 1.0]),
             np.array([0.0, 0.0, -1.0]),
+        ]
+        return axes[idx]
+
+    def _get_radial_axis(self) -> Optional[np.ndarray]:
+        """获取径向模式选中的轴方向，None = PCA 中轴线"""
+        idx = self._radial_axis.currentIndex()
+        if idx == 0:
+            return None
+        axes = [
+            None,
+            np.array([1.0, 0.0, 0.0]),
+            np.array([0.0, 1.0, 0.0]),
+            np.array([0.0, 0.0, 1.0]),
         ]
         return axes[idx]
 
@@ -313,6 +329,8 @@ class ActionsDeformationMixin:
         elif self._deform_mode == "radial":
             verts = self._deformed_inner_vertices if self._deformed_inner_vertices is not None else self._base_inner_vertices
             center = np.mean(verts, axis=0)
+            # 径向轴方向：通过 _direction 传递
+            direction = self._get_radial_axis()
 
         # 自适应模式：spinbox 值 = 目标间隙，不是偏移量
         if self._deform_mode == "adaptive":
