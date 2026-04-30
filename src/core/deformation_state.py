@@ -21,6 +21,7 @@ class DeformationStep:
     direction: Optional[List[float]]
     center_point: Optional[List[float]]
     region_indices: List[int]  # JSON 可序列化的索引列表
+    target_gap: float = 5.0  # 自适应模式目标间隙
 
 
 class DeformationState:
@@ -70,6 +71,7 @@ class DeformationState:
                 boundary_smooth=step.boundary_smooth,
                 direction=direction,
                 center_point=center,
+                _target_gap=step.target_gap,
             ))
         return params_list
 

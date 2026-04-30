@@ -26,6 +26,7 @@ class DeformationParams:
     boundary_smooth: float = 0.0  # 边界平滑半径 (mm)，0 = 不平滑
     direction: np.ndarray = None  # 自定义拉伸方向 (仅 directional 模式)
     center_point: np.ndarray = None  # 变形中心点
+    _target_gap: float = 5.0  # 自适应模式目标间隙 (mm)
 
 
 class DeformationEngine:
@@ -298,12 +299,14 @@ class DeformationEngine:
     def apply_adaptive(
         self,
         vertices: np.ndarray,
-        target_gap: float = 5.0,
+        target_gap: Optional[float] = None,
         current_gaps: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         自适应模式：自动调整护具尺寸使平均间隙接近 target_gap
         """
+        if target_gap is None:
+            target_gap = 5.0
         if current_gaps is None:
             foot_points = self._find_closest_foot_points(vertices)
             current_gaps = np.linalg.norm(vertices - foot_points, axis=1)
@@ -455,7 +458,7 @@ class DeformationEngine:
     ) -> np.ndarray:
         """统一入口：根据模式调用对应的变形方法"""
         if params.mode == "adaptive":
-            return self.apply_adaptive(vertices)
+            return self.apply_adaptive(vertices, params._target_gap)
         elif params.mode == "radial":
             return self.apply_radial(vertices, params)
         elif params.mode == "normal":
