@@ -26,6 +26,7 @@ class DeformationParams:
     boundary_smooth: float = 0.0  # 边界平滑半径 (mm)，0 = 不平滑
     direction: np.ndarray = None  # 自定义拉伸方向 (仅 directional 模式)
     center_point: np.ndarray = None  # 变形中心点
+    _target_gap: float = 5.0  # 自适应模式目标间隙 (mm)
 
 
 class DeformationEngine:
@@ -195,46 +196,97 @@ class DeformationEngine:
         params: DeformationParams,
     ) -> np.ndarray:
         """
-        法向模式：使用统一方向场变形
+        法向模式：变形空腔形状，外壳跟随，壁厚恒定。
 
-        位移方向 = 从曲面质心指向各顶点的径向方向（已在 __init__ 中预计算）
-        位移大小 = offset_mm × 权重（区域权重 × 衰减权重）
-        边界平滑：对权重标量场做拉普拉斯平滑
-
-        这样整个选区像一个鼓起的气球一样整体膨胀/收缩，
-        不会出现边缘折痕或方向不一致的问题。
+        与 directional 模式完全一致：对**所有顶点**计算平滑权重场，
+        每个顶点都有自己的位移（非最近邻继承），外壳无缝联动。
         """
         n = len(vertices)
         result = vertices.copy()
-        region_set = set(params.region_indices.tolist())
+        inner_idx_map = {int(idx): i for i, idx in enumerate(self.inner_indices)}
 
-        # 计算区域权重（硬边界）
-        region_weights = np.zeros(n, dtype=np.float64)
-        region_weights[params.region_indices] = 1.0
-
-        # 衰减权重
-        center = params.center_point if params.center_point is not None else np.mean(self._inner_vertices, axis=0)
-        if params.decay_radius > 0:
-            decay_weights = self._compute_weights(self._inner_vertices, center, params.decay_radius)
+        # ---- 变形中心点 ----
+        if params.center_point is not None:
+            center = params.center_point
         else:
-            decay_weights = np.ones(n, dtype=np.float64)
+            center = np.mean(self._inner_vertices, axis=0)
 
-        # 组合权重
-        final_weights = region_weights * decay_weights
+        # ---- 动态衰减半径（与 directional 一致） ----
+        inner_extent = np.ptp(self._inner_vertices, axis=0).max()
+        if params.decay_radius > 0:
+            effective_radius = max(params.decay_radius, inner_extent * 0.8)
+        else:
+            effective_radius = inner_extent * 1.2
 
-        # 边界平滑：对权重标量场做拉普拉斯平滑
-        if params.boundary_smooth > 0:
-            final_weights = self._smooth_weights(
-                final_weights, params.region_indices, params.boundary_smooth
-            )
+        # ---- 所有顶点统一平滑权重场（基于到中心的距离） ----
+        distances = np.linalg.norm(vertices - center, axis=1)
+        ratio = distances / effective_radius
+        all_weights = np.maximum(0.0, np.cos(np.pi * np.minimum(ratio, 1.0) / 2.0)) ** 2
 
-        # 应用变形
-        displacements = np.zeros_like(vertices)
-        active = final_weights > 0
-        for i in np.where(active)[0]:
-            displacements[i] = params.offset_mm * self._directions[i] * final_weights[i]
+        # ---- 方向场扩展到所有顶点 ----
+        # 内表面顶点：预计算的方向场
+        # 外壳顶点：通过最近邻内表面顶点的方向
+        from scipy.spatial import cKDTree
+        tree = cKDTree(self._inner_vertices)
+        _, nn_indices = tree.query(vertices, k=1)
+        all_directions = self._directions[nn_indices]
 
-        return result + displacements
+        # ---- 应用位移 ----
+        for i in range(n):
+            if all_weights[i] > 0:
+                result[i] += params.offset_mm * all_directions[i] * all_weights[i]
+
+        return result
+
+    def apply_normal_z(
+        self,
+        vertices: np.ndarray,
+        params: DeformationParams,
+    ) -> np.ndarray:
+        """
+        法向 Z轴圆柱模式：沿 Z 轴做圆柱形膨胀/收缩。
+
+        与质心放射模式的区别：
+        - 质心放射：每个顶点沿质心→自己的方向移动 → 球形/弧形膨胀
+        - Z轴圆柱：每个顶点沿垂直于Z轴的方向（径向远离Z轴）移动 → 圆柱形膨胀
+
+        方向场计算：
+        1. 取内表面顶点在 Z 轴上的中心线（XY 平面上的投影质心）
+        2. 每个顶点沿垂直于 Z 轴的方向（XY 平面内的径向）位移
+        3. 权重基于到中心线的距离（圆柱半径）
+        """
+        n = len(vertices)
+        result = vertices.copy()
+
+        # ---- Z轴中心线：内表面顶点在XY平面上的投影质心 ----
+        xy_center = np.mean(self._inner_vertices[:, :2], axis=0)  # (x_center, y_center)
+        center_3d = np.array([xy_center[0], xy_center[1], np.mean(self._inner_vertices[:, 2])])
+
+        # ---- 动态衰减半径 ----
+        inner_extent = np.ptp(self._inner_vertices, axis=0).max()
+        if params.decay_radius > 0:
+            effective_radius = max(params.decay_radius, inner_extent * 0.8)
+        else:
+            effective_radius = inner_extent * 1.2
+
+        # ---- 所有顶点统一平滑权重场 ----
+        distances = np.linalg.norm(vertices - center_3d, axis=1)
+        ratio = distances / effective_radius
+        all_weights = np.maximum(0.0, np.cos(np.pi * np.minimum(ratio, 1.0) / 2.0)) ** 2
+
+        # ---- Z轴圆柱方向场：垂直于Z轴的径向方向 ----
+        radial_xy = vertices - center_3d
+        radial_xy[:, 2] = 0  # 只保留 XY 分量
+        norms = np.linalg.norm(radial_xy, axis=1, keepdims=True)
+        norms[norms < 1e-10] = 1.0
+        radial_xy /= norms  # 归一化为 XY 平面内的单位方向
+
+        # ---- 应用位移 ----
+        for i in range(n):
+            if all_weights[i] > 0:
+                result[i] += params.offset_mm * radial_xy[i] * all_weights[i]
+
+        return result
 
     def _smooth_weights(
         self,
@@ -298,15 +350,17 @@ class DeformationEngine:
     def apply_adaptive(
         self,
         vertices: np.ndarray,
-        target_gap: float = 5.0,
+        target_gap: Optional[float] = None,
         current_gaps: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         自适应模式：自动调整护具尺寸使平均间隙接近 target_gap
         """
+        if target_gap is None:
+            target_gap = 5.0
         if current_gaps is None:
-            foot_points = self._find_closest_foot_points(vertices)
-            current_gaps = np.linalg.norm(vertices - foot_points, axis=1)
+            foot_points = self._find_closest_foot_points(self._inner_vertices)
+            current_gaps = np.linalg.norm(self._inner_vertices - foot_points, axis=1)
 
         mean_gap = np.mean(current_gaps)
         offset = target_gap - mean_gap
@@ -315,7 +369,7 @@ class DeformationEngine:
             vertices,
             DeformationParams(
                 mode="normal",
-                region_indices=np.arange(len(vertices)),
+                region_indices=np.arange(len(self._inner_vertices)),
                 offset_mm=offset,
             ),
         )
@@ -326,30 +380,47 @@ class DeformationEngine:
         params: DeformationParams,
     ) -> np.ndarray:
         """
-        径向模式：沿中轴线径向缩放
+        径向模式：沿中轴线径向缩放空腔，外壳跟随，壁厚恒定。
+
+        与 directional/normal 模式完全一致：对**所有顶点**计算平滑权重场，
+        每个顶点直接获得自己的位移。
         """
+        from scipy.spatial import cKDTree
+
+        n = len(vertices)
         result = vertices.copy()
 
-        # 拟合中轴线
-        axis_origin, axis_direction = self._fit_mid_axis(vertices)
+        axis_origin, axis_direction = self._get_radial_axis(
+            self._inner_vertices, params.direction
+        )
 
-        center = params.center_point if params.center_point is not None else np.mean(vertices, axis=0)
-        indices = params.region_indices
-        selected = vertices[indices]
+        # ---- 变形中心点 ----
+        if params.center_point is not None:
+            center = params.center_point
+        else:
+            center = np.mean(self._inner_vertices, axis=0)
 
-        # 计算径向向量
-        v = selected - axis_origin
+        # ---- 动态衰减半径（与 directional 一致） ----
+        inner_extent = np.ptp(self._inner_vertices, axis=0).max()
+        if params.decay_radius > 0:
+            effective_radius = max(params.decay_radius, inner_extent * 0.8)
+        else:
+            effective_radius = inner_extent * 1.2
+
+        # ---- 所有顶点统一平滑权重场（基于到中心的距离） ----
+        distances = np.linalg.norm(vertices - center, axis=1)
+        ratio = distances / effective_radius
+        all_weights = np.maximum(0.0, np.cos(np.pi * np.minimum(ratio, 1.0) / 2.0)) ** 2
+
+        # ---- 计算每个顶点相对于中轴线的径向向量 ----
+        v = vertices - axis_origin
         proj = np.dot(v, axis_direction)[:, np.newaxis] * axis_direction
-        radial_vec = selected - axis_origin - proj
+        radial_vec = v - proj  # (N, 3)
 
-        # 衰减权重
-        weights = self._compute_weights(selected, center, params.decay_radius)
-
-        # 应用径向缩放
+        # ---- 应用位移 ----
         scale_delta = params.scale_factor - 1.0
-        for i in range(len(indices)):
-            w = weights[i]
-            result[indices[i]] += scale_delta * radial_vec[i] * w
+        active = all_weights > 0
+        result[active] += scale_delta * radial_vec[active] * all_weights[active, np.newaxis]
 
         return result
 
@@ -422,29 +493,29 @@ class DeformationEngine:
         点驱动变形（手指按弹性塑料板）
 
         内侧面顶点：按距离衰减权重变形
-        外侧面顶点：继承最近内侧面顶点的变形量（厚度均匀联动）
+        外侧面顶点：直接继承内侧面位移向量（壁厚恒定）
         """
+        from scipy.spatial import cKDTree
+
         center, direction, weights = self.compute_directional_field(params)
 
-        # ---- 内表面变形 ----
         result = vertices.copy()
         inner_idx_map = {int(idx): i for i, idx in enumerate(self.inner_indices)}
-        inner_disp = {}  # inner_mesh_idx -> displacement vector
 
+        # ---- 内表面变形 ----
+        inner_disp = np.zeros((len(self._inner_vertices), 3), dtype=np.float64)
         for inner_array_idx in range(len(self._inner_vertices)):
             mesh_idx = int(self.inner_indices[inner_array_idx])
             d = params.offset_mm * direction * weights[mesh_idx]
             result[mesh_idx] += d
             inner_disp[inner_array_idx] = d
 
-        # ---- 外壳联动：每个外表面顶点继承最近内表面顶点的变形 ----
-        outer_indices = [i for i in range(len(vertices)) if i not in inner_idx_map]
-        if outer_indices:
-            # 对每个外表面顶点，找到最近的内表面顶点
-            for outer_idx in outer_indices:
-                nearest_array_idx = self._find_nearest_inner_vertex(vertices[outer_idx])
-                if nearest_array_idx in inner_disp:
-                    result[outer_idx] += inner_disp[nearest_array_idx]
+        # ---- 外壳联动：直接继承内表面位移向量 ----
+        outer_indices = np.array([i for i in range(len(vertices)) if i not in inner_idx_map])
+        if len(outer_indices) > 0:
+            tree = cKDTree(self._inner_vertices)
+            _, nn_indices = tree.query(vertices[outer_indices], k=1)
+            result[outer_indices] += inner_disp[nn_indices]
 
         return result
 
@@ -455,11 +526,13 @@ class DeformationEngine:
     ) -> np.ndarray:
         """统一入口：根据模式调用对应的变形方法"""
         if params.mode == "adaptive":
-            return self.apply_adaptive(vertices)
+            return self.apply_adaptive(vertices, params._target_gap)
         elif params.mode == "radial":
             return self.apply_radial(vertices, params)
         elif params.mode == "normal":
             return self.apply_normal(vertices, params)
+        elif params.mode == "normal_z":
+            return self.apply_normal_z(vertices, params)
         elif params.mode == "directional":
             return self.apply_directional(vertices, params)
         else:
@@ -499,3 +572,24 @@ class DeformationEngine:
             main_axis = -main_axis
 
         return centroid, main_axis
+
+    @staticmethod
+    def _get_radial_axis(
+        vertices: np.ndarray,
+        user_axis: Optional[np.ndarray] = None,
+    ) -> tuple:
+        """
+        获取径向轴
+
+        如果用户指定了轴向，使用用户选择（原点在顶点质心）
+        否则使用 PCA 拟合中轴线
+        """
+        centroid = np.mean(vertices, axis=0)
+
+        if user_axis is not None:
+            norm = np.linalg.norm(user_axis)
+            if norm > 1e-10:
+                user_axis = user_axis / norm
+            return centroid, user_axis
+
+        return DeformationEngine._fit_mid_axis(vertices)

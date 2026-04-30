@@ -27,6 +27,8 @@ class OptimizationResult:
     mean_distance: float          # 平均距离
     std_distance: float           # 距离标准差
     coverage_4_6mm: float         # 4-6mm 覆盖率
+    min_distance: float = 0.0     # 最小径向间隙（负值=穿透）
+    max_distance: float = 0.0     # 最大径向间隙
 
 
 class BraceOptimizer:
@@ -239,12 +241,15 @@ class BraceOptimizer:
         """
         评估给定位置的优劣（使用快速径向距离计算）
 
-        评分标准：
-        1. 4-6mm 区间顶点比例（主要指标）
-        2. 径向距离标准差（次要指标，越小越好）
+        评分策略：
+        1. 所有径向距离 >= 0 的位置才有资格获得高分
+        2. 有负值的位置给予严厉惩罚（基于最大穿透深度），但仍可比较
+           这样搜索算法能找到"逃离穿透"的方向
+        3. 无穿透的位置中，4-6mm 区间比例越高越好
+        4. 标准差小的位置更优
 
         返回:
-            综合得分（越高越好）
+            综合得分（越高越好）。有穿透时得分 < 0，无穿透时得分 >= 0
         """
         # 应用变换
         transformed = self._apply_transform(translation, rotation)
@@ -252,26 +257,29 @@ class BraceOptimizer:
         # 快速计算径向距离（向量化）
         radial_gaps = self._compute_radial_distances_fast(transformed)
 
-        # 统计
         total = len(radial_gaps)
-        valid_mask = radial_gaps > 0  # 只统计有效值（有交点的）
-        valid_count = np.sum(valid_mask)
+        min_gap = float(np.min(radial_gaps))
 
-        if valid_count == 0:
-            return -np.inf
+        # === 有穿透：得分 = 负值，基于最大穿透深度 ===
+        if min_gap < 0:
+            # 穿透越深，得分越低；轻微穿透接近 0
+            # 乘以一个大的系数确保任何有穿透的位置都比无穿透的差
+            return min_gap * 100.0
 
-        # 4-6mm 区间比例
-        ideal = np.sum(
-            (radial_gaps[valid_mask] >= 4) & (radial_gaps[valid_mask] <= 6)
-        )
-        ideal_ratio = ideal / valid_count
+        # === 无穿透：正常评分 ===
+        # 4-6mm 区间比例（主要指标）
+        ideal = np.sum((radial_gaps >= 4) & (radial_gaps <= 6))
+        ideal_ratio = ideal / total
 
-        # 标准差惩罚
-        std = np.std(radial_gaps[valid_mask])
+        # 标准差惩罚（次要指标）
+        std = np.std(radial_gaps)
         std_penalty = min(std / 10, 0.3)
 
-        # 综合评分
-        score = ideal_ratio - std_penalty
+        # 最小间隙奖励：鼓励护具远离足部
+        min_gap_bonus = min(min_gap / 20, 0.1)  # 最多 +0.1
+
+        # 综合评分：无穿透时一定 >= 0
+        score = ideal_ratio - std_penalty + min_gap_bonus
 
         return score
 
@@ -299,6 +307,107 @@ class BraceOptimizer:
         ])
 
         return Rz @ Ry @ Rx
+
+    def _escape_penetration(
+        self,
+        start_translation: np.ndarray,
+        start_rotation: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, float]:
+        """
+        当搜索空间中所有位置都有穿透时，系统性逃离穿透区域
+
+        策略：
+        1. 从当前位置开始，沿远离足部表面的方向移动
+        2. 找到第一个所有径向距离 >= 0 的位置
+        3. 在该位置附近做小范围搜索优化 4-6mm 覆盖率
+
+        返回:
+            (translation, rotation, score)
+        """
+        print("\n【约束满足】逃离穿透区域...")
+
+        # 步长序列：从 2mm 开始，每次增加 2mm，最多到 50mm
+        steps = np.arange(2.0, 52.0, 2.0)
+
+        # 搜索方向：沿着护具内侧面顶点到足部最近点的平均反向
+        # 以及各轴正负方向
+        directions = [
+            np.array([1, 0, 0]),
+            np.array([-1, 0, 0]),
+            np.array([0, 1, 0]),
+            np.array([0, -1, 0]),
+            np.array([0, 0, 1]),
+            np.array([0, 0, -1]),
+        ]
+
+        # 计算平均反向（从护具顶点到足部最近点的方向）
+        transformed = self._apply_transform(start_translation, start_rotation)
+        distances, indices = self.foot_tree.query(transformed, k=1)
+        foot_points = self.foot_points[indices]
+        avg_dir = (transformed - foot_points).mean(axis=0)
+        avg_norm = np.linalg.norm(avg_dir)
+        if avg_norm > 0:
+            directions.insert(0, avg_dir / avg_norm)
+            directions.insert(1, -avg_dir / avg_norm)
+
+        best_translation = start_translation.copy()
+        best_rotation = start_rotation.copy()
+        best_score = -np.inf
+
+        for d_idx, direction in enumerate(directions):
+            for step in steps:
+                offset = direction * step
+                translation = start_translation + offset
+                score = self._evaluate_position(translation, start_rotation)
+
+                if score > best_score:
+                    best_score = score
+                    best_translation = translation.copy()
+                    best_rotation = start_rotation.copy()
+
+                # 找到无穿透位置即可停止这个方向
+                if score >= 0:
+                    print(
+                        f"  方向 {d_idx+1}/{len(directions)}: "
+                        f"在偏移 {step:.0f}mm 处找到无穿透位置 (得分={score:.3f})"
+                    )
+                    break
+
+            # 如果已经找到无穿透位置，不再尝试其他方向
+            if best_score >= 0:
+                break
+
+        if best_score < 0:
+            print("  警告：所有搜索方向仍有穿透，返回最佳结果")
+            return start_translation, start_rotation, best_score
+
+        # 在找到的有效位置附近做小范围搜索优化
+        print("  在有效位置附近优化 4-6mm 覆盖率...")
+        local_offsets = np.arange(-2.0, 2.1, 0.5)
+        local_rot_offsets = np.arange(-1.0, 1.1, 0.5)
+
+        for dx in local_offsets:
+            for dy in local_offsets:
+                for dz in local_offsets:
+                    translation = best_translation + np.array([dx, dy, dz])
+                    score = self._evaluate_position(translation, best_rotation)
+                    if score > best_score:
+                        best_score = score
+                        best_translation = translation.copy()
+
+        for rx in local_rot_offsets:
+            for ry in local_rot_offsets:
+                for rz in local_rot_offsets:
+                    rotation = np.array([rx, ry, rz])
+                    score = self._evaluate_position(best_translation, rotation)
+                    if score > best_score:
+                        best_score = score
+                        best_rotation = rotation.copy()
+
+        print(f"  优化完成 | 得分: {best_score:.3f}")
+        print(f"    平移：X={best_translation[0]:+.1f}, Y={best_translation[1]:+.1f}, Z={best_translation[2]:+.1f} mm")
+
+        return best_translation, best_rotation, best_score
 
     def optimize(
         self,
@@ -497,6 +606,15 @@ class BraceOptimizer:
 
         total_elapsed = time.time() - start_time
         print(f"\n{'='*60}")
+
+        # === 约束满足：确保结果中所有径向距离 >= 0 ===
+        if fine_score < 0:
+            print(" 未找到无穿透的位置，尝试扩展搜索逃离穿透...")
+            fine_translation, fine_rotation, fine_score = self._escape_penetration(
+                fine_translation, fine_rotation
+            )
+            total_elapsed = time.time() - start_time
+
         print(f" 优化完成 | 总耗时：{total_elapsed:.1f}秒")
         print(f"{'='*60}")
         print(f"  平移：X={fine_translation[0]:+.2f}, Y={fine_translation[1]:+.2f}, Z={fine_translation[2]:+.2f} mm")
@@ -506,25 +624,36 @@ class BraceOptimizer:
         transformed = self._apply_transform(fine_translation, fine_rotation)
         radial_gaps = self._compute_radial_distances_fast(transformed)
 
-        valid_mask = radial_gaps > 0
-        valid_count = np.sum(valid_mask)
-        ideal = np.sum((radial_gaps[valid_mask] >= 4) & (radial_gaps[valid_mask] <= 6))
-        ideal_ratio = ideal / valid_count * 100 if valid_count > 0 else 0
+        min_gap = float(np.min(radial_gaps))
+        max_gap = float(np.max(radial_gaps))
+        mean_gap = float(np.mean(radial_gaps))
+        std_gap = float(np.std(radial_gaps))
+        total = len(radial_gaps)
+        ideal = int(np.sum((radial_gaps >= 4) & (radial_gaps <= 6)))
+        ideal_ratio = ideal / total * 100 if total > 0 else 0
+        negative_count = int(np.sum(radial_gaps < 0))
 
         print(f"\n【结果统计】")
-        print(f"  平均径向间隙：{np.mean(radial_gaps[valid_mask]):.2f} mm")
-        print(f"  间隙标准差：{np.std(radial_gaps[valid_mask]):.2f} mm")
-        print(f"  理想区间 (4-6mm): {ideal}/{valid_count} 点 ({ideal_ratio:.1f}%)")
+        if negative_count > 0:
+            print(f"  ⚠ 警告：仍有 {negative_count} 个顶点穿透足部（最小径向间隙：{min_gap:+.2f} mm）")
+        else:
+            print(f"  最小径向间隙：{min_gap:+.2f} mm（无穿透）")
+        print(f"  最大径向间隙：{max_gap:.2f} mm")
+        print(f"  平均径向间隙：{mean_gap:.2f} mm")
+        print(f"  间隙标准差：{std_gap:.2f} mm")
+        print(f"  理想区间 (4-6mm): {ideal}/{total} 点 ({ideal_ratio:.1f}%)")
 
         return OptimizationResult(
             translation=fine_translation,
             rotation=fine_rotation,
             ideal_ratio=ideal_ratio / 100,
-            ideal_count=int(ideal),
-            total_count=int(valid_count),
-            mean_distance=float(np.mean(radial_gaps[valid_mask])),
-            std_distance=float(np.std(radial_gaps[valid_mask])),
+            ideal_count=ideal,
+            total_count=total,
+            mean_distance=mean_gap,
+            std_distance=std_gap,
             coverage_4_6mm=ideal_ratio,
+            min_distance=min_gap,
+            max_distance=max_gap,
         )
 
     def optimize_grid_search(
