@@ -1302,6 +1302,7 @@ class ActionsMixin:
         try:
             writer = vtk.vtkSTLWriter()
             writer.SetFileName(filepath)
+            writer.SetFileTypeToBinary()
             writer.SetInputData(self.brace_model.polydata)
             writer.Write()
             self.status_bar.showMessage(f"已导出 STL: {Path(filepath).name}")
@@ -1325,6 +1326,7 @@ class ActionsMixin:
             temp_stl = filepath + ".temp.stl"
             writer = vtk.vtkSTLWriter()
             writer.SetFileName(temp_stl)
+            writer.SetFileTypeToBinary()
             writer.SetInputData(self.brace_model.polydata)
             writer.Write()
 

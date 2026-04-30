@@ -1,18 +1,158 @@
-"""变形引擎、选点、预览、撤销、重放相关操作"""
+"""变形引擎、选点、预览、撤销、重放、STL对比相关操作"""
 
+import os
 from typing import Optional
 
 import numpy as np
 import vtk
-from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QMessageBox
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtWidgets import QMessageBox, QFileDialog, QProgressDialog
 
 from src.core.deformation_engine import DeformationEngine, DeformationParams
 from src.core.deformation_state import DeformationState, DeformationStep
 
 
+class _CompareWorker(QThread):
+    """后台线程：执行 STL 对比计算（避免大文件阻塞主线程导致闪退）"""
+    finished = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+    def __init__(self, filepath_a: str, filepath_b: str, tolerance: float):
+        super().__init__()
+        self.filepath_a = filepath_a
+        self.filepath_b = filepath_b
+        self.tolerance = tolerance
+
+    def run(self):
+        try:
+            from src.core.stl_comparator import compare_stl
+            report = compare_stl(
+                self.filepath_a, self.filepath_b,
+                tolerance=self.tolerance, same_topology=False
+            )
+            self.finished.emit(report)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 class ActionsDeformationMixin:
-    """Mixin: 变形模式、选点、预览、应用、撤销、重放"""
+    """Mixin: 变形模式、选点、预览、应用、撤销、重放、STL对比"""
+
+    # ---- STL 对比 ----
+
+    _compare_file_a: Optional[str] = None
+    _compare_file_b: Optional[str] = None
+
+    def _select_compare_file_a(self):
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "选择 STL 文件 A", "", "STL Files (*.stl)"
+        )
+        if filepath:
+            self._compare_file_a = filepath
+            self.lbl_compare_a.setText(f"文件 A: {filepath}")
+
+    def _select_compare_file_b(self):
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "选择 STL 文件 B", "", "STL Files (*.stl)"
+        )
+        if filepath:
+            self._compare_file_b = filepath
+            self.lbl_compare_b.setText(f"文件 B: {filepath}")
+
+    def _run_compare(self):
+        if not self._compare_file_a:
+            self.status_bar.showMessage("请先选择文件 A")
+            return
+        if not self._compare_file_b:
+            self.status_bar.showMessage("请先选择文件 B")
+            return
+
+        self.status_bar.showMessage("正在对比 STL 文件...")
+        self.compare_result.setText("计算中...\n\n大文件可能需要几分钟，请耐心等待。")
+
+        tolerance = self.spin_compare_tol.value()
+        self._compare_worker = _CompareWorker(
+            self._compare_file_a, self._compare_file_b, tolerance
+        )
+        self._compare_worker.finished.connect(self._on_compare_done)
+        self._compare_worker.error.connect(self._on_compare_error)
+        self._compare_worker.start()
+
+    def _on_compare_done(self, report):
+        """后台对比完成，在主线程构建报告文本"""
+        import os
+
+        sep = "\u2500" * 60
+        lines = []
+        lines.append("=" * 60)
+        lines.append("STL 文件结构对比报告")
+        lines.append("=" * 60)
+
+        s = report.stats_a
+        label_a = os.path.basename(self._compare_file_a)
+        lines.append(f"\n{label_a}:")
+        lines.append(f"  顶点数:   {s.vertex_count:,}")
+        lines.append(f"  三角面数: {s.triangle_count:,}")
+        lines.append(f"  体积:     {s.volume:,.2f} mm\u00b3")
+        lines.append(f"  表面积:   {s.surface_area:,.2f} mm\u00b2")
+        lines.append(f"  质心:     ({s.centroid[0]:.2f}, {s.centroid[1]:.2f}, {s.centroid[2]:.2f})")
+        lines.append(f"  尺寸:     {s.extent[0]:.2f} \u00d7 {s.extent[1]:.2f} \u00d7 {s.extent[2]:.2f} mm")
+
+        s = report.stats_b
+        label_b = os.path.basename(self._compare_file_b)
+        lines.append(f"\n{label_b}:")
+        lines.append(f"  顶点数:   {s.vertex_count:,}")
+        lines.append(f"  三角面数: {s.triangle_count:,}")
+        lines.append(f"  体积:     {s.volume:,.2f} mm\u00b3")
+        lines.append(f"  表面积:   {s.surface_area:,.2f} mm\u00b2")
+        lines.append(f"  质心:     ({s.centroid[0]:.2f}, {s.centroid[1]:.2f}, {s.centroid[2]:.2f})")
+        lines.append(f"  尺寸:     {s.extent[0]:.2f} \u00d7 {s.extent[1]:.2f} \u00d7 {s.extent[2]:.2f} mm")
+
+        lines.append(f"\n{sep}")
+        lines.append("差异分析:")
+        lines.append(f"  顶点差:   {report.stats_b.vertex_count - report.stats_a.vertex_count:+,}")
+        lines.append(f"  面差:     {report.stats_b.triangle_count - report.stats_a.triangle_count:+,}")
+        lines.append(f"  体积差:   {report.stats_b.volume - report.stats_a.volume:+,.2f} mm\u00b3")
+        lines.append(f"  表面积差: {report.stats_b.surface_area - report.stats_a.surface_area:+,.2f} mm\u00b2")
+
+        lines.append(f"\n{sep}")
+        lines.append("拓扑对比:")
+        topo_str = "是" if report.topology_match else "否"
+        lines.append(f"  拓扑一致: {topo_str}")
+        for diff in report.topology_differences[:5]:
+            lines.append(f"  - {diff}")
+
+        lines.append(f"\n{sep}")
+        lines.append("几何距离 (mm) \u2014 A\u7684\u6bcf\u4e2a\u9876\u70b9\u5230B\u7684\u6700\u8fd1\u9876\u70b9\u8ddd\u79bb:")
+        p10, p25, p50, p75, p90, p95, p99 = report.distance_percentiles
+        lines.append(f"  平均:  {report.mean_distance:.4f}")
+        lines.append(f"  RMS:   {report.rms_distance:.4f}")
+        lines.append(f"  最大:  {report.max_distance:.4f}")
+        lines.append(f"  P10:   {p10:.4f}  P25: {p25:.4f}  P50: {p50:.4f}")
+        lines.append(f"  P75:   {p75:.4f}  P90: {p90:.4f}  P95: {p95:.4f}")
+        lines.append(f"  P99:   {p99:.4f}")
+        tolerance = self.spin_compare_tol.value()
+        lines.append(f"  \u91cd\u53e0\u7387 (\u516c\u5dee {tolerance}mm \u5185): {report.overlap_ratio * 100:.1f}%")
+        lines.append("=" * 60)
+
+        # 文件大小对比
+        size_a = os.path.getsize(self._compare_file_a)
+        size_b = os.path.getsize(self._compare_file_b)
+        lines.append(f"\n\u6587\u4ef6\u5927\u5c0f:")
+        lines.append(f"  {label_a}: {size_a / 1024:.1f} KB")
+        lines.append(f"  {label_b}: {size_b / 1024:.1f} KB")
+        ratio = (size_b / size_a - 1) * 100 if size_a > 0 else 0
+        lines.append(f"  \u5dee\u5f02:   {size_b - size_a:+,.0f} bytes ({ratio:+.1f}%)")
+        lines.append("=" * 60)
+
+        self.compare_result.setText("\n".join(lines))
+        self.status_bar.showMessage(f"\u5bf9\u6bd4\u5b8c\u6210: {label_a} vs {label_b}")
+
+    def _on_compare_error(self, error_msg: str):
+        self.compare_result.setText(f"\u5bf9\u6bd4\u5931\u8d25:\n{error_msg}")
+        self.status_bar.showMessage("STL \u5bf9\u6bd4\u5931\u8d25")
+
+    # ---- 变形模式、选点、预览、应用、撤销、重放 ----
 
     def _on_deform_mode_changed(self):
         idx = self.combo_deform_mode.currentIndex()

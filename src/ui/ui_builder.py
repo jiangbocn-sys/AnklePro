@@ -56,6 +56,7 @@ class UIBuilderMixin:
             ("尺寸修改", 5),
             ("统计结果", 4),
             ("显示设置", 3),
+            ("STL对比", 6),
         ]
         for text, idx in nav_items:
             btn = QPushButton("\n".join(text))
@@ -469,6 +470,70 @@ class UIBuilderMixin:
 
         deform_layout.addStretch()
         self.stack.addWidget(deform_tab)
+
+        # ============ 页面 6: STL对比 ============
+        compare_tab = QWidget()
+        compare_layout = QVBoxLayout(compare_tab)
+        compare_layout.setContentsMargins(6, 6, 6, 6)
+
+        # 文件选择
+        file_group = QGroupBox("选择文件")
+        file_layout = QVBoxLayout()
+
+        # 文件 A
+        layout_a = QHBoxLayout()
+        self.lbl_compare_a = QLabel("文件 A: 未选择")
+        self.lbl_compare_a.setWordWrap(True)
+        btn_select_a = QPushButton("选择文件 A")
+        btn_select_a.clicked.connect(self._select_compare_file_a)
+        layout_a.addWidget(btn_select_a)
+        layout_a.addWidget(self.lbl_compare_a)
+        file_layout.addLayout(layout_a)
+
+        # 文件 B
+        layout_b = QHBoxLayout()
+        self.lbl_compare_b = QLabel("文件 B: 未选择")
+        self.lbl_compare_b.setWordWrap(True)
+        btn_select_b = QPushButton("选择文件 B")
+        btn_select_b.clicked.connect(self._select_compare_file_b)
+        layout_b.addWidget(btn_select_b)
+        layout_b.addWidget(self.lbl_compare_b)
+        file_layout.addLayout(layout_b)
+
+        # 公差
+        tol_layout = QHBoxLayout()
+        tol_layout.addWidget(QLabel("公差 (mm):"))
+        self.spin_compare_tol = QDoubleSpinBox()
+        self.spin_compare_tol.setRange(0.001, 10.0)
+        self.spin_compare_tol.setSingleStep(0.01)
+        self.spin_compare_tol.setValue(0.01)
+        self.spin_compare_tol.setDecimals(3)
+        tol_layout.addWidget(self.spin_compare_tol)
+        tol_layout.addStretch()
+        file_layout.addLayout(tol_layout)
+
+        file_group.setLayout(file_layout)
+        compare_layout.addWidget(file_group)
+
+        # 对比按钮
+        btn_compare = QPushButton("开始对比")
+        btn_compare.clicked.connect(self._run_compare)
+        btn_compare.setMinimumHeight(40)
+        btn_compare.setStyleSheet("font-weight: bold; font-size: 13px;")
+        compare_layout.addWidget(btn_compare)
+
+        # 结果展示
+        result_group = QGroupBox("对比结果")
+        result_layout = QVBoxLayout()
+        self.compare_result = QTextEdit()
+        self.compare_result.setReadOnly(True)
+        self.compare_result.setFont(QFont("Menlo", 10))
+        result_layout.addWidget(self.compare_result)
+        result_group.setLayout(result_layout)
+        compare_layout.addWidget(result_group)
+
+        compare_layout.addStretch()
+        self.stack.addWidget(compare_tab)
 
         # 坐标信息
         coord_group = QGroupBox("护具位置")
