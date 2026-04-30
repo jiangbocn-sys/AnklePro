@@ -196,46 +196,50 @@ class DeformationEngine:
         params: DeformationParams,
     ) -> np.ndarray:
         """
-        法向模式：使用统一方向场变形
+        法向模式：变形空腔形状，外壳跟随，壁厚恒定。
 
-        位移方向 = 从曲面质心指向各顶点的径向方向（已在 __init__ 中预计算）
-        位移大小 = offset_mm × 权重（区域权重 × 衰减权重）
-        边界平滑：对权重标量场做拉普拉斯平滑
-
-        这样整个选区像一个鼓起的气球一样整体膨胀/收缩，
-        不会出现边缘折痕或方向不一致的问题。
+        内表面选区顶点直接变形。
+        外壳顶点：继承最近内表面顶点的位移向量（直接复用，不重新计算方向）。
+        这样保证壁厚在变形过程中始终不变。
         """
+        from scipy.spatial import cKDTree
+
         n = len(vertices)
         result = vertices.copy()
-        region_set = set(params.region_indices.tolist())
 
-        # 计算区域权重（硬边界）
-        region_weights = np.zeros(n, dtype=np.float64)
+        inner_idx_map = {int(idx): i for i, idx in enumerate(self.inner_indices)}
+
+        # ---- 内表面变形 ----
+        region_weights = np.zeros(len(self._inner_vertices), dtype=np.float64)
         region_weights[params.region_indices] = 1.0
 
-        # 衰减权重
         center = params.center_point if params.center_point is not None else np.mean(self._inner_vertices, axis=0)
         if params.decay_radius > 0:
             decay_weights = self._compute_weights(self._inner_vertices, center, params.decay_radius)
         else:
-            decay_weights = np.ones(n, dtype=np.float64)
+            decay_weights = np.ones(len(self._inner_vertices), dtype=np.float64)
 
-        # 组合权重
         final_weights = region_weights * decay_weights
 
-        # 边界平滑：对权重标量场做拉普拉斯平滑
         if params.boundary_smooth > 0:
             final_weights = self._smooth_weights(
                 final_weights, params.region_indices, params.boundary_smooth
             )
 
-        # 应用变形
-        displacements = np.zeros_like(vertices)
+        inner_disp = np.zeros((len(self._inner_vertices), 3), dtype=np.float64)
         active = final_weights > 0
         for i in np.where(active)[0]:
-            displacements[i] = params.offset_mm * self._directions[i] * final_weights[i]
+            inner_disp[i] = params.offset_mm * self._directions[i] * final_weights[i]
+            result[int(self.inner_indices[i])] += inner_disp[i]
 
-        return result + displacements
+        # ---- 外壳联动：直接继承内表面位移向量 ----
+        outer_indices = np.array([i for i in range(n) if i not in inner_idx_map])
+        if len(outer_indices) > 0:
+            tree = cKDTree(self._inner_vertices)
+            _, nn_indices = tree.query(vertices[outer_indices], k=1)
+            result[outer_indices] += inner_disp[nn_indices]
+
+        return result
 
     def _smooth_weights(
         self,
@@ -308,8 +312,8 @@ class DeformationEngine:
         if target_gap is None:
             target_gap = 5.0
         if current_gaps is None:
-            foot_points = self._find_closest_foot_points(vertices)
-            current_gaps = np.linalg.norm(vertices - foot_points, axis=1)
+            foot_points = self._find_closest_foot_points(self._inner_vertices)
+            current_gaps = np.linalg.norm(self._inner_vertices - foot_points, axis=1)
 
         mean_gap = np.mean(current_gaps)
         offset = target_gap - mean_gap
@@ -318,7 +322,7 @@ class DeformationEngine:
             vertices,
             DeformationParams(
                 mode="normal",
-                region_indices=np.arange(len(vertices)),
+                region_indices=np.arange(len(self._inner_vertices)),
                 offset_mm=offset,
             ),
         )
@@ -329,30 +333,38 @@ class DeformationEngine:
         params: DeformationParams,
     ) -> np.ndarray:
         """
-        径向模式：沿中轴线径向缩放
+        径向模式：沿中轴线径向缩放空腔，外壳跟随，壁厚恒定。
         """
+        from scipy.spatial import cKDTree
+
         result = vertices.copy()
 
-        # 拟合中轴线
-        axis_origin, axis_direction = self._fit_mid_axis(vertices)
+        axis_origin, axis_direction = self._fit_mid_axis(self._inner_vertices)
 
-        center = params.center_point if params.center_point is not None else np.mean(vertices, axis=0)
+        center = params.center_point if params.center_point is not None else np.mean(self._inner_vertices, axis=0)
         indices = params.region_indices
-        selected = vertices[indices]
 
-        # 计算径向向量
+        # ---- 内表面变形 ----
+        selected = self._inner_vertices[indices]
         v = selected - axis_origin
         proj = np.dot(v, axis_direction)[:, np.newaxis] * axis_direction
         radial_vec = selected - axis_origin - proj
-
-        # 衰减权重
         weights = self._compute_weights(selected, center, params.decay_radius)
 
-        # 应用径向缩放
+        inner_disp = np.zeros((len(self._inner_vertices), 3), dtype=np.float64)
         scale_delta = params.scale_factor - 1.0
         for i in range(len(indices)):
-            w = weights[i]
-            result[indices[i]] += scale_delta * radial_vec[i] * w
+            disp = scale_delta * radial_vec[i] * weights[i]
+            inner_disp[int(indices[i])] = disp
+            result[int(self.inner_indices[indices[i]])] += disp
+
+        # ---- 外壳联动：直接继承内表面位移向量 ----
+        inner_idx_map = {int(idx): i for i, idx in enumerate(self.inner_indices)}
+        outer_indices = np.array([i for i in range(len(vertices)) if i not in inner_idx_map])
+        if len(outer_indices) > 0:
+            tree = cKDTree(self._inner_vertices)
+            _, nn_indices = tree.query(vertices[outer_indices], k=1)
+            result[outer_indices] += inner_disp[nn_indices]
 
         return result
 
@@ -425,29 +437,29 @@ class DeformationEngine:
         点驱动变形（手指按弹性塑料板）
 
         内侧面顶点：按距离衰减权重变形
-        外侧面顶点：继承最近内侧面顶点的变形量（厚度均匀联动）
+        外侧面顶点：直接继承内侧面位移向量（壁厚恒定）
         """
+        from scipy.spatial import cKDTree
+
         center, direction, weights = self.compute_directional_field(params)
 
-        # ---- 内表面变形 ----
         result = vertices.copy()
         inner_idx_map = {int(idx): i for i, idx in enumerate(self.inner_indices)}
-        inner_disp = {}  # inner_mesh_idx -> displacement vector
 
+        # ---- 内表面变形 ----
+        inner_disp = np.zeros((len(self._inner_vertices), 3), dtype=np.float64)
         for inner_array_idx in range(len(self._inner_vertices)):
             mesh_idx = int(self.inner_indices[inner_array_idx])
             d = params.offset_mm * direction * weights[mesh_idx]
             result[mesh_idx] += d
             inner_disp[inner_array_idx] = d
 
-        # ---- 外壳联动：每个外表面顶点继承最近内表面顶点的变形 ----
-        outer_indices = [i for i in range(len(vertices)) if i not in inner_idx_map]
-        if outer_indices:
-            # 对每个外表面顶点，找到最近的内表面顶点
-            for outer_idx in outer_indices:
-                nearest_array_idx = self._find_nearest_inner_vertex(vertices[outer_idx])
-                if nearest_array_idx in inner_disp:
-                    result[outer_idx] += inner_disp[nearest_array_idx]
+        # ---- 外壳联动：直接继承内表面位移向量 ----
+        outer_indices = np.array([i for i in range(len(vertices)) if i not in inner_idx_map])
+        if len(outer_indices) > 0:
+            tree = cKDTree(self._inner_vertices)
+            _, nn_indices = tree.query(vertices[outer_indices], k=1)
+            result[outer_indices] += inner_disp[nn_indices]
 
         return result
 

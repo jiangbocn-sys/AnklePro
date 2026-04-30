@@ -252,6 +252,10 @@ class ActionsModelMixin:
                 center=self.brace_model.centroid
             )
 
+            # 保存原始护具副本（用于还原操作）
+            self._original_brace_polydata = vtk.vtkPolyData()
+            self._original_brace_polydata.DeepCopy(self.brace_model.polydata)
+
             if self.scene._brace_actor:
                 self.scene.renderer.RemoveActor(self.scene._brace_actor)
             self.scene.add_brace_model(self.brace_model.polydata)

@@ -95,6 +95,7 @@ class MainWindow(UIBuilderMixin, ActionsModelMixin, ActionsInnerMixin,
         self._deformed_inner_vertices: Optional[np.ndarray] = None  # 变形后的内表面顶点位置
         self._preview_vertices: Optional[np.ndarray] = None  # 当前预览的顶点位置
         self._brace_step_filepath: Optional[str] = None  # 护具 STEP 文件路径
+        self._original_brace_polydata: Optional[vtk.vtkPolyData] = None  # 原始护具副本（用于还原）
 
         self._setup_ui()
         self._setup_menu()

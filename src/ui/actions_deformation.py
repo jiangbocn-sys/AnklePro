@@ -404,31 +404,12 @@ class ActionsDeformationMixin:
             f"正在预览: 偏移={params.offset_mm:+.1f}mm, 区域顶点数 {len(params.region_indices):,} ..."
         )
 
-        if params.mode == "directional":
-            all_vertices = self._get_all_brace_vertices()
-            deformed = self.deformation_engine.apply(all_vertices, params)
-            inner_idx = self._inner_vertex_indices.astype(int)
-            all_idx = set(inner_idx.tolist())
-            outer_idx = [i for i in range(len(all_vertices)) if i not in all_idx]
-            inner_disp = np.linalg.norm(deformed[inner_idx] - all_vertices[inner_idx], axis=1)
-            if outer_idx:
-                outer_idx = np.array(outer_idx)
-                outer_disp = np.linalg.norm(deformed[outer_idx] - all_vertices[outer_idx], axis=1)
-                print(f"[方向拉伸] 总顶点 {len(all_vertices)}, 内表面 {len(inner_idx)} / 外表面 {len(outer_idx)}")
-                print(f"  内表面: 最大位移 {np.max(inner_disp):.2f}mm, 平均 {np.mean(inner_disp):.2f}mm")
-                print(f"  外表面: 最大位移 {np.max(outer_disp):.2f}mm, 平均 {np.mean(outer_disp):.2f}mm")
-            else:
-                print(f"[方向拉伸] 总顶点 {len(all_vertices)}, 全部为内表面顶点")
-                print(f"  最大位移 {np.max(inner_disp):.2f}mm")
-            self._preview_vertices = deformed
-            self._deformed_inner_vertices = deformed[inner_idx].copy()
-            self._apply_vertex_update_full(deformed)
-        else:
-            deformed = self.deformation_engine.apply(
-                self._deformed_inner_vertices, params
-            )
-            self._preview_vertices = deformed
-            self._apply_vertex_update(deformed)
+        all_vertices = self._get_all_brace_vertices()
+        deformed = self.deformation_engine.apply(all_vertices, params)
+        inner_idx = self._inner_vertex_indices.astype(int)
+        self._deformed_inner_vertices = deformed[inner_idx].copy()
+        self._preview_vertices = deformed
+        self._apply_vertex_update_full(deformed)
         self._render()
 
         if self._deform_mode == "adaptive":
@@ -464,13 +445,8 @@ class ActionsDeformationMixin:
             params = self._get_deformation_params()
             if params is None:
                 return
-            if params.mode == "directional":
-                all_vertices = self._get_all_brace_vertices()
-                final = self.deformation_engine.apply(all_vertices, params)
-            else:
-                final = self.deformation_engine.apply(
-                    self._deformed_inner_vertices, params
-                )
+            all_vertices = self._get_all_brace_vertices()
+            final = self.deformation_engine.apply(all_vertices, params)
 
         step = DeformationStep(
             mode=params.mode,
@@ -489,12 +465,9 @@ class ActionsDeformationMixin:
         )
         self.deformation_state.push(step)
 
-        if params.mode == "directional":
-            self._deformed_inner_vertices = final.copy()[self._inner_vertex_indices.astype(int)]
-            self._apply_vertex_update_full(final)
-        else:
-            self._deformed_inner_vertices = final.copy()
-            self._apply_vertex_update(final)
+        inner_idx = self._inner_vertex_indices.astype(int)
+        self._deformed_inner_vertices = final.copy()[inner_idx]
+        self._apply_vertex_update_full(final)
 
         self._preview_vertices = None
         self._render()
@@ -516,14 +489,80 @@ class ActionsDeformationMixin:
             )
 
     def _revert_preview(self):
-        if self._preview_vertices is None and self.deformation_state.step_count == 0:
-            self.status_bar.showMessage("当前没有可还原的操作")
+        """还原到原始模型（保留当前位移变换 + 内侧面选择）"""
+        if self.brace_model is None:
+            self.status_bar.showMessage("当前没有护具模型")
+            return
+        if self._original_brace_polydata is None:
+            self.status_bar.showMessage("原始模型数据不存在，请重新加载护具")
             return
 
+        # 保留当前位移变换
+        current_translation = self.brace_transform.get_translation().copy()
+        current_rotation = [
+            self.brace_transform.get_rotation()[i]
+            for i in range(3)
+        ]
+
+        # 保存内侧面选择状态
+        saved_inner_cells = self._inner_cells
+        saved_inner_vertex_indices = self._inner_vertex_indices
+        saved_inner_regions = list(self._inner_regions)
+        saved_region_checks = []
+        for i in range(self.region_list.count()):
+            item = self.region_list.item(i)
+            checked = item.checkState() == Qt.Checked
+            data = item.data(Qt.UserRole)
+            saved_region_checks.append((checked, data))
+
+        # 移除所有内侧面高亮 actor
+        self.scene.clear_inner_surface_actors()
+        self._region_actor_map.clear()
+
+        # 用原始副本替换护具 polydata
+        self.brace_model.polydata.DeepCopy(self._original_brace_polydata)
+        self.brace_model.polydata.Modified()
+
+        # 重建 mapper（恢复原始颜色）
+        self._rebuild_brace_mapper()
+
+        # 恢复位移变换
+        self.brace_transform.reset()
+        self.brace_transform.translate(*current_translation)
+        self.brace_transform.rotate_x(current_rotation[0])
+        self.brace_transform.rotate_y(current_rotation[1])
+        self.brace_transform.rotate_z(current_rotation[2])
+
+        # 重置变形状态
         self._preview_vertices = None
-        self._replay_deformations()
+        self._deformed_inner_vertices = None
+        self._original_inner_vertices = None
+        self._base_inner_vertices = None
+        self.deformation_engine = None
+        self.deformation_state.clear()
+        self.current_distances = None
+        self.scene.clear_distance_colors()
+
+        # 恢复内侧面选择
+        self._inner_cells = saved_inner_cells
+        self._inner_vertex_indices = saved_inner_vertex_indices
+        self._inner_regions = saved_inner_regions
+
+        # 恢复区域列表勾选状态
+        self.region_list.clear()
+        for i, (checked, data) in enumerate(saved_region_checks):
+            from PyQt5.QtWidgets import QListWidgetItem
+            item = QListWidgetItem()
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setData(Qt.UserRole, data)
+            label = data[0] if data else f"区域 {i}"
+            item.setText(str(label))
+            item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+            self.region_list.addItem(item)
+
+        self._update_brace_view()
         self._render()
-        self.status_bar.showMessage("已还原预览，回到变形前状态")
+        self.status_bar.showMessage("已还原到原始模型（位移变换和内侧面选择保持不变）")
 
     def _undo_deformation(self):
         if self.deformation_state.step_count == 0:
@@ -542,21 +581,34 @@ class ActionsDeformationMixin:
             return
         if self.deformation_engine is None:
             return
+        if self._original_brace_polydata is None:
+            return
 
+        # 先从原始模型重新初始化内表面顶点
+        from vtk.util.numpy_support import vtk_to_numpy
+        orig_vertices = vtk_to_numpy(self._original_brace_polydata.GetPoints().GetData())
+
+        self._base_inner_vertices = orig_vertices[self._inner_vertex_indices.astype(int)].copy()
         self._deformed_inner_vertices = self._base_inner_vertices.copy()
+
+        # 先把护具恢复到原始状态
+        self.brace_model.polydata.DeepCopy(self._original_brace_polydata)
+        self._rebuild_brace_mapper()
+
+        # 重新初始化变形引擎（基于原始顶点）
+        self.deformation_engine = DeformationEngine(
+            self.foot_model.polydata,
+            self.brace_model.polydata,
+            self._inner_vertex_indices,
+        )
+
         all_vertices = self._get_all_brace_vertices()
 
         for step in self.deformation_state.get_params_list():
-            if step.mode == "directional":
-                deformed_all = self.deformation_engine.apply(all_vertices, step)
-                self._deformed_inner_vertices = deformed_all[self._inner_vertex_indices.astype(int)].copy()
-                self._apply_vertex_update_full(deformed_all)
-                all_vertices = deformed_all
-            else:
-                self._deformed_inner_vertices = self.deformation_engine.apply(
-                    self._deformed_inner_vertices, step
-                )
-                self._apply_vertex_update(self._deformed_inner_vertices)
+            deformed_all = self.deformation_engine.apply(all_vertices, step)
+            self._deformed_inner_vertices = deformed_all[self._inner_vertex_indices.astype(int)].copy()
+            self._apply_vertex_update_full(deformed_all)
+            all_vertices = deformed_all
 
     def _apply_vertex_update(self, deformed_vertices: np.ndarray):
         if self.brace_model is None:
