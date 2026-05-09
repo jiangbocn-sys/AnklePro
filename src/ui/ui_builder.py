@@ -57,6 +57,7 @@ class UIBuilderMixin:
             ("统计结果", 4),
             ("显示设置", 3),
             ("STL对比", 6),
+            ("模型映射", 7),
         ]
         for text, idx in nav_items:
             btn = QPushButton("\n".join(text))
@@ -534,6 +535,92 @@ class UIBuilderMixin:
 
         compare_layout.addStretch()
         self.stack.addWidget(compare_tab)
+
+        # ============ 页面 7: 模型映射 ============
+        map_tab = QWidget()
+        map_layout = QVBoxLayout(map_tab)
+        map_layout.setContentsMargins(6, 6, 6, 6)
+
+        # 模型类型选择
+        type_group = QGroupBox("模型类型")
+        type_layout = QHBoxLayout()
+        self.combo_map_type = QComboBox()
+        self.combo_map_type.addItems(["足部模型", "护具模型"])
+        self.combo_map_type.currentIndexChanged.connect(self._on_map_type_changed)
+        type_layout.addWidget(QLabel("对比类型:"))
+        type_layout.addWidget(self.combo_map_type)
+        type_layout.addStretch()
+        type_group.setLayout(type_layout)
+        map_layout.addWidget(type_group)
+
+        # 文件选择
+        file_group = QGroupBox("选择模型")
+        file_layout = QVBoxLayout()
+
+        layout_a = QHBoxLayout()
+        self.lbl_map_a = QLabel("A (参考): 未选择")
+        self.lbl_map_a.setWordWrap(True)
+        btn_select_a = QPushButton("选择参考模型 A")
+        btn_select_a.clicked.connect(self._select_map_model_a)
+        layout_a.addWidget(btn_select_a)
+        layout_a.addWidget(self.lbl_map_a)
+        file_layout.addLayout(layout_a)
+
+        layout_b = QHBoxLayout()
+        self.lbl_map_b = QLabel("B (目标): 未选择")
+        self.lbl_map_b.setWordWrap(True)
+        btn_select_b = QPushButton("选择目标模型 B")
+        btn_select_b.clicked.connect(self._select_map_model_b)
+        layout_b.addWidget(btn_select_b)
+        layout_b.addWidget(self.lbl_map_b)
+        file_layout.addLayout(layout_b)
+
+        file_group.setLayout(file_layout)
+        map_layout.addWidget(file_group)
+
+        # 操作按钮
+        btn_map = QPushButton("计算映射")
+        btn_map.clicked.connect(self._run_mapping)
+        btn_map.setMinimumHeight(40)
+        btn_map.setStyleSheet("font-weight: bold; font-size: 13px;")
+        map_layout.addWidget(btn_map)
+
+        # 结果摘要
+        summary_group = QGroupBox("映射结果")
+        summary_layout = QVBoxLayout()
+        self.lbl_map_matrix = QLabel("仿射矩阵: 未计算")
+        self.lbl_map_matrix.setWordWrap(True)
+        self.lbl_map_matrix.setStyleSheet("font-family: Menlo; font-size: 10px;")
+        summary_layout.addWidget(self.lbl_map_matrix)
+        self.lbl_map_residual = QLabel("残差: 未计算")
+        self.lbl_map_residual.setWordWrap(True)
+        self.lbl_map_residual.setStyleSheet("font-family: Menlo; font-size: 10px;")
+        summary_layout.addWidget(self.lbl_map_residual)
+        summary_group.setLayout(summary_layout)
+        map_layout.addWidget(summary_group)
+
+        # 预览和导出按钮
+        action_btn_row = QHBoxLayout()
+        btn_preview = QPushButton("预览变换")
+        btn_preview.clicked.connect(self._preview_transformed)
+        btn_export = QPushButton("导出 STL")
+        btn_export.clicked.connect(self._export_transformed_model)
+        action_btn_row.addWidget(btn_preview)
+        action_btn_row.addWidget(btn_export)
+        map_layout.addLayout(action_btn_row)
+
+        # 详细报告
+        result_group = QGroupBox("详细报告")
+        result_layout = QVBoxLayout()
+        self.map_result_text = QTextEdit()
+        self.map_result_text.setReadOnly(True)
+        self.map_result_text.setFont(QFont("Menlo", 10))
+        result_layout.addWidget(self.map_result_text)
+        result_group.setLayout(result_layout)
+        map_layout.addWidget(result_group)
+
+        map_layout.addStretch()
+        self.stack.addWidget(map_tab)
 
         # 坐标信息
         coord_group = QGroupBox("护具位置")

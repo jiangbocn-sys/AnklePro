@@ -30,11 +30,13 @@ from src.ui.actions_analysis import ActionsAnalysisMixin
 from src.ui.actions_deformation import ActionsDeformationMixin
 from src.ui.actions_position import ActionsPositionMixin
 from src.ui.actions_tools import ActionsToolsMixin
+from src.ui.actions_mapping import ActionsMappingMixin
 
 
 class MainWindow(UIBuilderMixin, ActionsModelMixin, ActionsInnerMixin,
                  ActionsAnalysisMixin, ActionsDeformationMixin,
-                 ActionsPositionMixin, ActionsToolsMixin, QMainWindow):
+                 ActionsPositionMixin, ActionsToolsMixin, ActionsMappingMixin,
+                 QMainWindow):
     """AnklePro 主窗口"""
 
     def __init__(self):
